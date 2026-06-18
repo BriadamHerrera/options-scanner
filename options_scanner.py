@@ -84,15 +84,43 @@ data_src = "🟢 Alpaca (real-time)" if ALPACA_OK else "🟡 yfinance (delayed)"
 st.caption(f"Price data: {data_src}  ·  Options: yfinance  ·  13-factor anti-fakeout strategy  |  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 # tf_label is set in sidebar — show active timeframe in a badge after sidebar renders
 
+# ─── TRADING-STYLE PRESETS ───────────────────────────────────────────────────────
+# Each preset sets the widget session_state keys before the widgets render.
+PRESETS = {
+    # 1–5 day swings: Daily chart, 30 DTE, stricter score, trend-confirming ADX
+    "swing": {"k_tf": "Daily", "k_dte": 30, "k_score": 8, "k_iv": 50, "k_adx": 22,
+              "k_spread": 20, "k_open": "Off"},
+    # Same-day / intraday: 15min chart, short DTE, looser score, skip the open
+    "day":   {"k_tf": "15min", "k_dte": 7,  "k_score": 6, "k_iv": 60, "k_adx": 18,
+              "k_spread": 25, "k_open": "15 min"},
+}
+
+def apply_preset(name):
+    for k, v in PRESETS[name].items():
+        st.session_state[k] = v
+
+# Initialise widget defaults once (Swing-friendly) so presets can override cleanly.
+_DEFAULTS = {"k_tf": "Daily", "k_dte": 30, "k_score": 6, "k_iv": 50,
+             "k_adx": 20, "k_spread": 20, "k_open": "15 min"}
+for _k, _v in _DEFAULTS.items():
+    st.session_state.setdefault(_k, _v)
+
 # ─── SIDEBAR ─────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Filters")
 
+    st.caption("**Quick presets**")
+    pc1, pc2 = st.columns(2)
+    pc1.button("🎯 Swing (1–5d)", use_container_width=True,
+               on_click=apply_preset, args=("swing",))
+    pc2.button("⚡ Day Trade", use_container_width=True,
+               on_click=apply_preset, args=("day",))
+
     tf_label = st.radio(
         "⏱ Timeframe",
         options=list(TF_OPTIONS.keys()),
-        index=4,  # default Daily
         horizontal=True,
+        key="k_tf",
     )
     tf_cfg = TF_OPTIONS[tf_label]
 
@@ -102,11 +130,11 @@ with st.sidebar:
         watchlist += [t.strip().upper() for t in custom_input.split(",") if t.strip()]
         watchlist = list(dict.fromkeys(watchlist))
 
-    target_dte     = st.select_slider("Target DTE", options=[7,14,21,30,45,60], value=30)
-    min_score      = st.slider("Min signal score (0–13)", 0, 13, 6)
-    max_iv_rank    = st.slider("Max IV Rank % (cheaper = lower)", 0, 100, 50)
-    min_adx        = st.slider("Min ADX (trend strength)", 10, 40, 20)
-    max_spread_pct = st.slider("Max bid/ask spread %", 5, 50, 20)
+    target_dte     = st.select_slider("Target DTE", options=[7,14,21,30,45,60], key="k_dte")
+    min_score      = st.slider("Min signal score (0–13)", 0, 13, key="k_score")
+    max_iv_rank    = st.slider("Max IV Rank % (cheaper = lower)", 0, 100, key="k_iv")
+    min_adx        = st.slider("Min ADX (trend strength)", 10, 40, key="k_adx")
+    max_spread_pct = st.slider("Max bid/ask spread %", 5, 50, key="k_spread")
 
     st.divider()
     skip_earnings  = st.toggle("Skip stocks with earnings ≤5 days", value=True)
@@ -118,7 +146,7 @@ with st.sidebar:
     open_wait = st.selectbox(
         "⏳ Skip after market open",
         options=["Off", "15 min", "30 min", "60 min"],
-        index=1,
+        key="k_open",
         help="Ignores the chaotic opening candles after 9:30 ET on intraday timeframes — they produce the most fakeouts. Tune this once you see how it behaves live.",
     )
     open_wait_mins = {"Off": 0, "15 min": 15, "30 min": 30, "60 min": 60}[open_wait]
