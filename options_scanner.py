@@ -56,11 +56,11 @@ TF_OPTIONS = {
 }
 
 # ─── WATCHLIST ───────────────────────────────────────────────────────────────────
+# Pruned to names with a proven backtested edge (positive in BOTH 6mo & 1yr tests).
+# Removed chronic losers: TSLA, PLTR, NVDA, AVGO, SOFI, META, SMCI, MU.
 WATCHLIST = [
-    "SPY","QQQ","AAPL","TSLA","NVDA",
-    "AMD","MSFT","AMZN","META","GOOGL",
-    "NFLX","COIN","MSTR","PLTR","ARM",
-    "SMCI","AVGO","MU","SOFI","HOOD",
+    "ARM","AMD","GOOGL","COIN","NFLX",
+    "AAPL","AMZN","MSFT","QQQ","MSTR","HOOD",
 ]
 MIN_OI = 100  # raised from 50 — better liquidity
 
@@ -371,6 +371,96 @@ def rsi_calc(close, period=14):
 def historical_vol(close, period=20):
     returns = np.log(close / close.shift()).dropna()
     return float(returns.rolling(period).std().iloc[-1] * np.sqrt(252) * 100)
+
+
+# ─── BACKTEST ENGINE ─────────────────────────────────────────────────────────────
+
+def _score_at_bar(window, spy_window, min_adx_val):
+    """Compute direction + score (0–13) at the last bar of `window`. Mirrors scan()."""
+    close, high, low, open_, vol = window["Close"], window["High"], window["Low"], window["Open"], window["Volume"]
+    score = 0
+    direction, dpts = confirmed_donchian(close, high, low)
+    score += dpts
+    sdir, spts = ema_stack_score(close)
+    if sdir == direction and spts > 0:
+        score += spts
+    adx_v, dip, dim = adx_calc(high, low, close)
+    if adx_v >= min_adx_val and ((direction=="BULLISH" and dip>dim) or (direction=="BEARISH" and dim>dip)):
+        score += 1
+    if bb_squeeze(close):
+        score += 1
+    md = macd_signal(close)
+    if (direction=="BULLISH" and md in ("BULLISH","BULLISH_TREND")) or (direction=="BEARISH" and md in ("BEARISH","BEARISH_TREND")):
+        score += 1
+    vavg = float(vol.iloc[-21:-1].mean()); vr = float(vol.iloc[-1])/vavg if vavg>0 else 1.0
+    if vr >= 1.5:
+        score += 1
+    bc, brc = candle_quality(close.iloc[-1], open_.iloc[-1], high.iloc[-1], low.iloc[-1])
+    if (direction=="BULLISH" and bc) or (direction=="BEARISH" and brc):
+        score += 1
+    sret = (float(close.iloc[-1])-float(close.iloc[-21]))/float(close.iloc[-21])*100
+    spyret = (float(spy_window["Close"].iloc[-1])-float(spy_window["Close"].iloc[-21]))/float(spy_window["Close"].iloc[-21])*100
+    if (direction=="BULLISH" and sret>spyret) or (direction=="BEARISH" and sret<spyret):
+        score += 1
+    aok, _ = atr_regime(high, low, close)
+    if aok:
+        score += 1
+    spy_bull = float(spy_window["Close"].iloc[-1]) > float(ema(spy_window["Close"],50).iloc[-1])
+    if (direction=="BULLISH" and spy_bull) or (direction=="BEARISH" and not spy_bull):
+        score += 1
+    rsi = rsi_calc(close)
+    if (direction=="BULLISH" and 40<=rsi<=75) or (direction=="BEARISH" and 25<=rsi<=60):
+        score += 1
+    score += 1  # earnings assumed clear (not checked historically)
+    return direction, score, round(adx_v,1), round(rsi,1)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def run_backtest(symbol, eval_days, min_score_bt, min_adx_val, hold_bars=3, stop_pct=3.0, tgt_pct=6.0):
+    """
+    Walk-forward backtest of the directional signal on the UNDERLYING.
+    Returns (trades_list, rows_for_table). Uses yfinance daily history (reliable warmup).
+    """
+    try:
+        data = yf.Ticker(symbol).history(period="2y")[["Open","High","Low","Close","Volume"]]
+        spy  = yf.Ticker("SPY").history(period="2y")[["Open","High","Low","Close","Volume"]]
+        data.index = data.index.tz_localize(None); spy.index = spy.index.tz_localize(None)
+        common = data.index.intersection(spy.index)
+        data, spy = data.loc[common], spy.loc[common]
+    except Exception:
+        return None, None
+    if len(data) < 230:
+        return None, None
+
+    start = len(data) - eval_days
+    trades, table = [], []
+    for i in range(max(start, 220), len(data)):
+        w, sw = data.iloc[:i+1], spy.iloc[:i+1]
+        direction, score, adx_v, rsi = _score_at_bar(w, sw, min_adx_val)
+        if direction == "NEUTRAL" or score < min_score_bt or i+1 >= len(data):
+            continue
+        entry = float(data["Open"].iloc[i+1]); exit_px, outcome, held = None, "TIME", 0
+        for j in range(i+1, min(i+1+hold_bars, len(data))):
+            held += 1
+            hi, lo = float(data["High"].iloc[j]), float(data["Low"].iloc[j])
+            if direction == "BULLISH":
+                if lo <= entry*(1-stop_pct/100): exit_px, outcome = entry*(1-stop_pct/100), "STOP"; break
+                if hi >= entry*(1+tgt_pct/100):  exit_px, outcome = entry*(1+tgt_pct/100), "TARGET"; break
+            else:
+                if hi >= entry*(1+stop_pct/100): exit_px, outcome = entry*(1+stop_pct/100), "STOP"; break
+                if lo <= entry*(1-tgt_pct/100):  exit_px, outcome = entry*(1-tgt_pct/100), "TARGET"; break
+        if exit_px is None:
+            exit_px = float(data["Close"].iloc[min(i+hold_bars, len(data)-1)])
+        ret = (exit_px-entry)/entry*100 * (1 if direction=="BULLISH" else -1)
+        trades.append(ret)
+        table.append({
+            "Date": str(data.index[i].date()),
+            "Signal": "🟢 CALL" if direction=="BULLISH" else "🔴 PUT",
+            "Score": f"{score}/13", "ADX": adx_v, "RSI": rsi,
+            "Entry": f"${entry:.2f}", "Exit": f"${exit_px:.2f}",
+            "Outcome": outcome, "Days": held, "Return": f"{ret:+.2f}%",
+        })
+    return trades, table
 
 
 def iv_rank_estimate(symbol, current_iv, tf_label, open_wait_mins=0):
@@ -781,11 +871,12 @@ def render_table(data):
     st.dataframe(pd.DataFrame(table), use_container_width=True, hide_index=True)
 
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     f"📋 All ({len(rows)})",
     f"🟢 Calls ({len(calls)})",
     f"🔴 Puts ({len(puts)})",
     "🔍 Trade Builder",
+    "🧪 Backtest",
 ])
 
 with tab1: render_table(rows)
@@ -922,6 +1013,60 @@ with tab4:
                 fig.add_trace(go.Scatter(x=hist2.index, y=hist2["EMA200"], name="EMA200", line=dict(color="#E91E63", width=1.5, dash="longdash")))
                 fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), height=340, legend=dict(orientation="h"))
                 st.plotly_chart(fig, use_container_width=True)
+
+# ─── BACKTEST TAB ────────────────────────────────────────────────────────────────
+
+with tab5:
+    st.subheader("🧪 Vet a Ticker Before You Trade It")
+    st.caption(
+        "Walk-forward backtest of the directional signal on the **underlying** (Daily bars). "
+        "Tells you whether this strategy historically had an edge on a given name — "
+        "**before** you risk money on it. Options would amplify these moves (and add theta cost)."
+    )
+
+    bc1, bc2, bc3 = st.columns([2,1,1])
+    bt_symbol = bc1.text_input("Ticker", value="AAPL", key="bt_sym").strip().upper()
+    bt_window = bc2.selectbox("Lookback", ["3 months","6 months","1 year","2 years"], index=2)
+    bt_score  = bc3.slider("Min score", 0, 13, 8, key="bt_score")
+    win_map   = {"3 months":63, "6 months":126, "1 year":252, "2 years":500}
+
+    if st.button("▶️ Run Backtest", use_container_width=True):
+        with st.spinner(f"Backtesting {bt_symbol}…"):
+            trades, table = run_backtest(bt_symbol, win_map[bt_window], bt_score, min_adx)
+
+        if trades is None:
+            st.error(f"Couldn't fetch enough history for {bt_symbol}.")
+        elif not trades:
+            st.warning(f"No signals fired for {bt_symbol} at score ≥{bt_score} in this window. The strategy stayed out — that's not necessarily bad.")
+        else:
+            arr  = np.array(trades)
+            wins = arr[arr > 0]
+            win_rate = len(wins)/len(arr)*100
+            expectancy = float(arr.mean())
+            total = float(arr.sum())
+
+            # Verdict
+            if expectancy > 0.3 and win_rate >= 45:
+                verdict, vcolor = "🟢 TRADEABLE — historical edge", "success"
+            elif expectancy > 0:
+                verdict, vcolor = "🟡 MARGINAL — thin edge, trade small", "warning"
+            else:
+                verdict, vcolor = "🔴 AVOID — strategy loses on this name", "error"
+            getattr(st, vcolor)(f"**{bt_symbol}: {verdict}**")
+
+            k1,k2,k3,k4,k5 = st.columns(5)
+            k1.metric("Signals", len(arr))
+            k2.metric("Win Rate", f"{win_rate:.0f}%")
+            k3.metric("Expectancy", f"{expectancy:+.2f}%", help="Average return per trade on the underlying")
+            k4.metric("Total", f"{total:+.1f}%")
+            k5.metric("Best / Worst", f"{arr.max():+.1f}/{arr.min():+.1f}%")
+
+            st.dataframe(pd.DataFrame(table[::-1]), use_container_width=True, hide_index=True)
+            st.caption(
+                "⚠️ Underlying returns only — real options add theta decay & spread, "
+                "so treat a thin positive expectancy as roughly breakeven. "
+                "Rules: enter next open, hold ≤3 days, stop −3% / target +6%."
+            )
 
 # ─── FOOTER ──────────────────────────────────────────────────────────────────────
 st.divider()
