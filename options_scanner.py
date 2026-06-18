@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 """
-Professional Options Scanner — Maximum Confluence Strategy
+Professional Options Scanner — Anti-Fakeout Maximum Confluence
 by Claude
 
-Scoring (0–10 pts):
-  1. Donchian breakout (20-day high/low)        → direction + 2pts
-  2. ADX > 20 aligned with direction             → +1pt
-  3. Bollinger Band squeeze                      → +1pt
-  4. MACD histogram aligned                      → +1pt
-  5. Volume spike > 1.5x avg                    → +1pt
-  6. IV Rank < 45% (cheap premium)              → +1pt
-  7. SPY market regime aligned                  → +1pt  [NEW]
-  8. RSI not extreme (not overbought/oversold)  → +1pt  [NEW]
-  9. Tight bid/ask spread < 15% of mid          → +1pt  [NEW]
- 10. No earnings within 5 days                  → +1pt  [NEW]
+Scoring (0–13 pts):
+  1. Confirmed Donchian breakout (>0.5% clearance)  → +2pts
+  2. EMA stack aligned (10>50>200 bulls / reverse bears) → +2pts  ← anti-fakeout
+  3. ADX > threshold aligned with direction          → +1pt
+  4. Bollinger Band squeeze                          → +1pt
+  5. MACD histogram aligned                          → +1pt
+  6. Volume spike > 1.5x avg                        → +1pt
+  7. Strong closing candle (no rejection wick)       → +1pt  ← anti-fakeout
+  8. Relative strength vs SPY (20-day)               → +1pt  ← anti-fakeout
+  9. ATR not in spike (< 1.5x its 1yr avg)          → +1pt  ← anti-fakeout
+ 10. SPY market regime aligned                       → +1pt
+ 11. RSI not extreme                                 → +1pt
+ 12. IV Rank < 45%                                   → +0.5pt (via options)
+ 13. Tight bid/ask spread                            → +0.5pt (via options)
+ 14. No earnings within 5 days                       → +1pt
 
-  Strong 7–10  |  Medium 5–6  |  Weak 3–4
+  Strong 9–13  |  Medium 6–8  |  Weak 3–5
 """
 
 import warnings
@@ -35,7 +39,7 @@ WATCHLIST = [
     "NFLX","COIN","MSTR","PLTR","ARM",
     "SMCI","AVGO","MU","SOFI","HOOD",
 ]
-MIN_OI = 50
+MIN_OI = 100  # raised from 50 — better liquidity
 
 # ─── PAGE CONFIG ─────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -48,15 +52,12 @@ st.set_page_config(
 st.markdown("""
 <style>
 [data-testid="stMetricValue"] { font-size:1.5rem; font-weight:700; }
-.signal-strong { color:#00e676; font-weight:700; }
-.signal-medium { color:#ffeb3b; font-weight:700; }
-.signal-weak   { color:#ff7043; font-weight:700; }
-.earnings-warn { background:#7b3f00; color:#ffcc80; padding:4px 10px; border-radius:4px; font-weight:700; font-size:0.85rem; }
+.anti-fakeout { background:#1a237e; color:#90caf9; padding:3px 9px; border-radius:4px; font-size:0.8rem; font-weight:700; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🎯 Options Scanner Pro — Maximum Confluence")
-st.caption(f"10-factor strategy: Breakout · ADX · BB Squeeze · MACD · Volume · IV Rank · SPY Regime · RSI · Spread · Earnings  |  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+st.title("🎯 Options Scanner Pro — Anti-Fakeout Edition")
+st.caption(f"13-factor strategy with fakeout filters: EMA stack · Candle quality · Rel. Strength · ATR regime · Confirmed breakout  |  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # ─── SIDEBAR ─────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -68,15 +69,15 @@ with st.sidebar:
         watchlist += [t.strip().upper() for t in custom_input.split(",") if t.strip()]
         watchlist = list(dict.fromkeys(watchlist))
 
-    target_dte    = st.select_slider("Target DTE", options=[7,14,21,30,45,60], value=30)
-    min_score     = st.slider("Min signal score (0–10)", 0, 10, 4)
-    max_iv_rank   = st.slider("Max IV Rank % (cheaper = lower)", 0, 100, 50)
-    min_adx       = st.slider("Min ADX (trend strength)", 10, 40, 18)
+    target_dte     = st.select_slider("Target DTE", options=[7,14,21,30,45,60], value=30)
+    min_score      = st.slider("Min signal score (0–13)", 0, 13, 6)
+    max_iv_rank    = st.slider("Max IV Rank % (cheaper = lower)", 0, 100, 50)
+    min_adx        = st.slider("Min ADX (trend strength)", 10, 40, 20)
     max_spread_pct = st.slider("Max bid/ask spread %", 5, 50, 20)
 
     st.divider()
-    skip_earnings = st.toggle("Skip stocks with earnings ≤5 days", value=True)
-    show_wait     = st.toggle("Show 'WAIT' signals too", value=False)
+    skip_earnings  = st.toggle("Skip stocks with earnings ≤5 days", value=True)
+    show_wait      = st.toggle("Show 'WAIT' signals too", value=False)
     if st.button("🔄 Refresh Data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
@@ -84,21 +85,17 @@ with st.sidebar:
 
     st.divider()
     st.markdown("""
-**Strategy Logic**
-- 🟢 **CALL** — Bullish breakout, cheap IV
-- 🔴 **PUT** — Bearish breakdown, cheap IV
-- ⚪ **WAIT** — No edge / IV too expensive
+**Anti-Fakeout Filters** 🛡️
+- 📐 **EMA Stack** — all 3 EMAs must line up (10>50>200)
+- 🕯️ **Candle Quality** — no rejection wicks near the close
+- 📊 **Rel. Strength** — stock must outperform SPY (calls) or underperform (puts)
+- 📡 **ATR Regime** — avoid news spikes (ATR not abnormally high)
+- ✅ **Confirmed Break** — must clear 20-day high/low by 0.5%+
 
-**Score**
-- 🔥 7–10 pts → Strong
-- ⚡ 5–6 pts → Medium
-- 💤 3–4 pts → Weak
-
-**New Filters**
-- 📊 **SPY Regime** — only take calls in bull market, puts in bear
-- 📉 **RSI Filter** — avoid buying overbought calls or oversold puts
-- 💸 **Spread Filter** — skip contracts with wide spreads (hard to fill)
-- 📅 **Earnings** — avoid IV crush from upcoming earnings
+**Score Thresholds**
+- 🔥 9–13 → Strong
+- ⚡ 6–8  → Medium
+- 💤 3–5  → Weak
     """)
 
 
@@ -108,59 +105,133 @@ def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 def sma(s, n): return s.rolling(n).mean()
 
 
-def donchian_signal(close: pd.Series, period=20):
+def confirmed_donchian(close, high, low, period=20, clearance=0.005):
+    """
+    Breakout must close above the 20-day high (or below low) by at least
+    0.5% — filters out breakouts that just nick the level.
+    """
     high20 = close.rolling(period).max().shift(1)
     low20  = close.rolling(period).min().shift(1)
-    last   = close.iloc[-1]
-    if last >= high20.iloc[-1]:
+    last_c = close.iloc[-1]
+    last_h = high.iloc[-1]
+    last_l = low.iloc[-1]
+
+    if last_c > high20.iloc[-1] * (1 + clearance):
         return "BULLISH", 2
-    elif last <= low20.iloc[-1]:
+    elif last_c < low20.iloc[-1] * (1 - clearance):
         return "BEARISH", 2
+    # Partial credit — touched but not confirmed
+    elif last_c >= high20.iloc[-1]:
+        return "BULLISH", 1
+    elif last_c <= low20.iloc[-1]:
+        return "BEARISH", 1
     return "NEUTRAL", 0
 
 
-def adx(high, low, close, period=14):
+def ema_stack_score(close):
+    """
+    EMA alignment: 10 > 50 > 200 = fully bullish stack (+2)
+    10 < 50 < 200 = fully bearish stack (+2)
+    Partial alignment = +1
+    """
+    e10  = float(ema(close, 10).iloc[-1])
+    e50  = float(ema(close, 50).iloc[-1])
+    e200 = float(ema(close, 200).iloc[-1])
+    last = float(close.iloc[-1])
+
+    bull_full = last > e10 > e50 > e200
+    bear_full = last < e10 < e50 < e200
+    bull_part = last > e50 and e10 > e50
+    bear_part = last < e50 and e10 < e50
+
+    if bull_full:   return "BULLISH", 2
+    if bear_full:   return "BEARISH", 2
+    if bull_part:   return "BULLISH", 1
+    if bear_part:   return "BEARISH", 1
+    return "NEUTRAL", 0
+
+
+def candle_quality(close, open_, high, low):
+    """
+    Anti-fakeout: the last candle should be a strong close with body > 50%
+    of total range and little wick in the opposite direction.
+    Bull candle: close near top of range, not a doji or bearish hammer.
+    Bear candle: close near bottom of range.
+    Returns (is_bull_quality, is_bear_quality).
+    """
+    c = float(close.iloc[-1])
+    o = float(open_.iloc[-1])
+    h = float(high.iloc[-1])
+    l = float(low.iloc[-1])
+    rng = h - l
+    if rng == 0:
+        return False, False
+    body   = abs(c - o)
+    body_pct = body / rng
+    close_pct = (c - l) / rng  # 1.0 = close at high, 0.0 = close at low
+
+    bull_ok = body_pct >= 0.4 and close_pct >= 0.6
+    bear_ok = body_pct >= 0.4 and close_pct <= 0.4
+    return bull_ok, bear_ok
+
+
+def adx_calc(high, low, close, period=14):
     tr  = pd.concat([
         high - low,
         (high - close.shift()).abs(),
         (low  - close.shift()).abs(),
     ], axis=1).max(axis=1)
     atr = tr.ewm(span=period, adjust=False).mean()
-
     dm_plus  = (high - high.shift()).clip(lower=0)
     dm_minus = (low.shift() - low).clip(lower=0)
     dm_plus  = dm_plus.where(dm_plus > dm_minus, 0)
     dm_minus = dm_minus.where(dm_minus > dm_plus, 0)
-
-    di_plus  = 100 * dm_plus.ewm(span=period, adjust=False).mean()  / atr
+    di_plus  = 100 * dm_plus.ewm(span=period, adjust=False).mean() / atr
     di_minus = 100 * dm_minus.ewm(span=period, adjust=False).mean() / atr
-    dx       = (100 * (di_plus - di_minus).abs() / (di_plus + di_minus).replace(0, np.nan))
+    dx       = 100 * (di_plus - di_minus).abs() / (di_plus + di_minus).replace(0, np.nan)
     adx_val  = dx.ewm(span=period, adjust=False).mean()
     return float(adx_val.iloc[-1]), float(di_plus.iloc[-1]), float(di_minus.iloc[-1])
 
 
-def bb_squeeze(close: pd.Series, period=20):
-    mid      = sma(close, period)
-    std      = close.rolling(period).std()
-    bw       = (std * 4) / mid
-    bw_min   = bw.rolling(125).min()
+def atr_regime(high, low, close, period=14):
+    """
+    Returns True if current ATR is NOT spiking (< 1.5x its 1-year average).
+    Spikes = news events, gap moves — high fakeout risk.
+    """
+    tr  = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low  - close.shift()).abs(),
+    ], axis=1).max(axis=1)
+    atr_pct  = (tr / close)
+    current  = float(atr_pct.iloc[-1])
+    avg_1yr  = float(atr_pct.rolling(252).mean().iloc[-1])
+    if avg_1yr == 0:
+        return True, 1.0
+    ratio = round(current / avg_1yr, 2)
+    return ratio < 1.5, ratio
+
+
+def bb_squeeze(close, period=20):
+    mid     = sma(close, period)
+    std     = close.rolling(period).std()
+    bw      = (std * 4) / mid
+    bw_min  = bw.rolling(125).min()
     return bw.iloc[-1] <= bw_min.iloc[-1] * 1.05
 
 
-def macd_signal(close: pd.Series):
+def macd_signal(close):
     macd_line = ema(close, 12) - ema(close, 26)
     signal    = ema(macd_line, 9)
     hist      = macd_line - signal
-    cross_up  = hist.iloc[-1] > 0 and hist.iloc[-2] <= 0
-    cross_dn  = hist.iloc[-1] < 0 and hist.iloc[-2] >= 0
-    if cross_up:   return "BULLISH"
-    if cross_dn:   return "BEARISH"
+    if hist.iloc[-1] > 0 and hist.iloc[-2] <= 0: return "BULLISH"
+    if hist.iloc[-1] < 0 and hist.iloc[-2] >= 0: return "BEARISH"
     if hist.iloc[-1] > hist.iloc[-2] > hist.iloc[-3]: return "BULLISH_TREND"
     if hist.iloc[-1] < hist.iloc[-2] < hist.iloc[-3]: return "BEARISH_TREND"
     return "NEUTRAL"
 
 
-def rsi(close: pd.Series, period=14):
+def rsi_calc(close, period=14):
     delta = close.diff()
     gain  = delta.clip(lower=0).ewm(span=period, adjust=False).mean()
     loss  = (-delta.clip(upper=0)).ewm(span=period, adjust=False).mean()
@@ -168,7 +239,7 @@ def rsi(close: pd.Series, period=14):
     return float((100 - 100 / (1 + rs)).iloc[-1])
 
 
-def historical_vol(close: pd.Series, period=20):
+def historical_vol(close, period=20):
     returns = np.log(close / close.shift()).dropna()
     return float(returns.rolling(period).std().iloc[-1] * np.sqrt(252) * 100)
 
@@ -191,19 +262,30 @@ def iv_rank_estimate(ticker_obj, current_iv):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_spy_regime():
-    """Returns 'BULL' if SPY is above its 50-day EMA, 'BEAR' otherwise."""
     try:
-        spy  = yf.Ticker("SPY").history(period="6mo")
+        spy  = yf.Ticker("SPY").history(period="1y")
         c    = spy["Close"]
         above = float(c.iloc[-1]) > float(ema(c, 50).iloc[-1])
-        return "BULL" if above else "BEAR"
+        # Also check 20-day return for momentum
+        ret20 = (float(c.iloc[-1]) - float(c.iloc[-21])) / float(c.iloc[-21]) * 100
+        return "BULL" if above else "BEAR", round(ret20, 2)
     except Exception:
-        return "UNKNOWN"
+        return "UNKNOWN", 0.0
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_earnings_date(symbol: str):
-    """Returns next earnings date as a date object, or None."""
+def get_spy_returns():
+    """20-day return for SPY — used for relative strength comparison."""
+    try:
+        spy = yf.Ticker("SPY").history(period="3mo")
+        c   = spy["Close"]
+        return (float(c.iloc[-1]) - float(c.iloc[-21])) / float(c.iloc[-21]) * 100
+    except Exception:
+        return 0.0
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_earnings_date(symbol):
     try:
         cal = yf.Ticker(symbol).calendar
         if cal is None or cal.empty:
@@ -275,42 +357,57 @@ def best_contract(ticker_obj, direction, spot, target_dte):
 # ─── CORE SCANNER ────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300, show_spinner=False)
-def scan(symbol, target_dte, min_adx_val, spy_regime):
+def scan(symbol, target_dte, min_adx_val, spy_regime, spy_ret20):
     try:
         tk   = yf.Ticker(symbol)
-        hist = tk.history(period="1y", interval="1d")
-        if len(hist) < 60:
+        hist = tk.history(period="2y", interval="1d")
+        if len(hist) < 210:  # need 200+ for EMA200
             return None
 
         close  = hist["Close"]
         high   = hist["High"]
         low    = hist["Low"]
+        open_  = hist["Open"]
         volume = hist["Volume"]
         spot   = float(close.iloc[-1])
         prev   = float(close.iloc[-2])
         chg    = round((spot - prev) / prev * 100, 2)
 
         score = 0
+        details = {}
 
-        # ── 1. Donchian breakout (2 pts) ─────────────────────────────────────
-        direction, don_score = donchian_signal(close, 20)
+        # ── 1. Confirmed Donchian breakout (0–2 pts) ─────────────────────────
+        direction, don_score = confirmed_donchian(close, high, low)
         score += don_score
+        details["breakout_pts"] = don_score
+        details["confirmed"]    = don_score == 2  # True = cleared 0.5%
 
-        # ── 2. ADX trend (1 pt) ──────────────────────────────────────────────
-        adx_val, di_plus, di_minus = adx(high, low, close)
+        # ── 2. EMA stack alignment (0–2 pts) [ANTI-FAKEOUT] ──────────────────
+        stack_dir, stack_pts = ema_stack_score(close)
+        ema_aligned = stack_dir == direction and stack_pts > 0
+        if ema_aligned:
+            score += stack_pts
+        details["ema_stack_pts"] = stack_pts if ema_aligned else 0
+        details["ema_stack_full"] = stack_pts == 2 and ema_aligned
+
+        # ── 3. ADX trend strength (0–1 pt) ───────────────────────────────────
+        adx_val, di_plus, di_minus = adx_calc(high, low, close)
         adx_val = round(adx_val, 1)
-        if adx_val >= min_adx_val:
-            if direction == "BULLISH" and di_plus > di_minus:
-                score += 1
-            elif direction == "BEARISH" and di_minus > di_plus:
-                score += 1
+        adx_ok = adx_val >= min_adx_val and (
+            (direction == "BULLISH" and di_plus > di_minus) or
+            (direction == "BEARISH" and di_minus > di_plus)
+        )
+        if adx_ok:
+            score += 1
+        details["adx_ok"] = adx_ok
 
-        # ── 3. BB squeeze (1 pt) ─────────────────────────────────────────────
+        # ── 4. BB squeeze (0–1 pt) ────────────────────────────────────────────
         squeeze = bb_squeeze(close)
         if squeeze:
             score += 1
+        details["squeeze"] = squeeze
 
-        # ── 4. MACD (1 pt) ───────────────────────────────────────────────────
+        # ── 5. MACD (0–1 pt) ──────────────────────────────────────────────────
         macd_dir = macd_signal(close)
         macd_ok  = (
             (direction == "BULLISH" and macd_dir in ("BULLISH", "BULLISH_TREND")) or
@@ -318,27 +415,47 @@ def scan(symbol, target_dte, min_adx_val, spy_regime):
         )
         if macd_ok:
             score += 1
+        details["macd_ok"] = macd_ok
+        details["macd_dir"] = macd_dir
 
-        # ── 5. Volume spike (1 pt) ───────────────────────────────────────────
+        # ── 6. Volume spike (0–1 pt) ──────────────────────────────────────────
         vol_avg   = float(volume.iloc[-21:-1].mean())
         vol_today = float(volume.iloc[-1])
         vol_ratio = round(vol_today / vol_avg, 2) if vol_avg > 0 else 1.0
         if vol_ratio >= 1.5:
             score += 1
+        details["vol_ratio"] = vol_ratio
 
-        # ── 6. RSI not extreme (1 pt) [NEW] ──────────────────────────────────
-        rsi_val = round(rsi(close), 1)
-        rsi_ok  = False
-        if direction == "BULLISH" and 40 <= rsi_val <= 75:
-            rsi_ok = True
+        # ── 7. Strong candle quality (0–1 pt) [ANTI-FAKEOUT] ─────────────────
+        bull_candle, bear_candle = candle_quality(close, open_, high, low)
+        candle_ok = (direction == "BULLISH" and bull_candle) or (direction == "BEARISH" and bear_candle)
+        if candle_ok:
             score += 1
-        elif direction == "BEARISH" and 25 <= rsi_val <= 60:
-            rsi_ok = True
-            score += 1
-        elif direction == "NEUTRAL":
-            rsi_ok = True  # neutral — don't penalise
+        details["candle_ok"] = candle_ok
 
-        # ── 7. SPY market regime (1 pt) [NEW] ────────────────────────────────
+        # ── 8. Relative strength vs SPY (0–1 pt) [ANTI-FAKEOUT] ──────────────
+        rs_ok = False
+        rs_val = 0.0
+        if symbol != "SPY" and len(close) >= 21:
+            stock_ret20 = (float(close.iloc[-1]) - float(close.iloc[-21])) / float(close.iloc[-21]) * 100
+            rs_val      = round(stock_ret20 - spy_ret20, 2)
+            if direction == "BULLISH" and stock_ret20 > spy_ret20:
+                rs_ok = True
+                score += 1
+            elif direction == "BEARISH" and stock_ret20 < spy_ret20:
+                rs_ok = True
+                score += 1
+        details["rs_ok"]  = rs_ok
+        details["rs_val"] = rs_val
+
+        # ── 9. ATR regime — not spiking (0–1 pt) [ANTI-FAKEOUT] ─────────────
+        atr_ok, atr_ratio = atr_regime(high, low, close)
+        if atr_ok:
+            score += 1
+        details["atr_ok"]    = atr_ok
+        details["atr_ratio"] = atr_ratio
+
+        # ── 10. SPY market regime (0–1 pt) ───────────────────────────────────
         spy_aligned = False
         if symbol != "SPY":
             if direction == "BULLISH" and spy_regime == "BULL":
@@ -348,20 +465,34 @@ def scan(symbol, target_dte, min_adx_val, spy_regime):
                 spy_aligned = True
                 score += 1
         else:
-            spy_aligned = True  # SPY always counts for itself
+            spy_aligned = True
+        details["spy_aligned"] = spy_aligned
 
-        # ── 8. Earnings proximity (1 pt) [NEW] ───────────────────────────────
-        earnings_date  = get_earnings_date(symbol)
-        today          = datetime.today().date()
-        days_to_earn   = (earnings_date - today).days if earnings_date else None
-        earnings_near  = days_to_earn is not None and 0 <= days_to_earn <= 5
-        earnings_score = not earnings_near  # pass = no earnings this week
-        if earnings_score:
+        # ── 11. RSI not extreme (0–1 pt) ──────────────────────────────────────
+        rsi_val = round(rsi_calc(close), 1)
+        rsi_ok  = (
+            (direction == "BULLISH" and 40 <= rsi_val <= 75) or
+            (direction == "BEARISH" and 25 <= rsi_val <= 60)
+        )
+        if rsi_ok:
             score += 1
+        details["rsi_ok"]  = rsi_ok
+        details["rsi_val"] = rsi_val
+
+        # ── 12. Earnings proximity (0–1 pt) ──────────────────────────────────
+        earnings_date = get_earnings_date(symbol)
+        today         = datetime.today().date()
+        days_to_earn  = (earnings_date - today).days if earnings_date else None
+        earnings_near = days_to_earn is not None and 0 <= days_to_earn <= 5
+        if not earnings_near:
+            score += 1
+        details["earnings_date"] = str(earnings_date) if earnings_date else None
+        details["days_to_earn"]  = days_to_earn
+        details["earnings_near"] = earnings_near
 
         hv_val = round(historical_vol(close), 1)
 
-        # Determine signal
+        # Signal
         if direction == "NEUTRAL" or score < 3:
             signal = "WAIT"
         elif direction == "BULLISH":
@@ -369,17 +500,16 @@ def scan(symbol, target_dte, min_adx_val, spy_regime):
         else:
             signal = "PUT"
 
-        # Strength label
-        if score >= 7:
+        if score >= 9:
             strength, strength_val = "🔥 Strong", 3
-        elif score >= 5:
+        elif score >= 6:
             strength, strength_val = "⚡ Medium", 2
         else:
-            strength, strength_val = "💤 Weak",   1
+            strength, strength_val = "💤 Weak", 1
 
-        # ── 9+10. Options: IV rank (1 pt) + tight spread (1 pt) [NEW] ────────
-        opt     = None
-        iv_rank = None
+        # ── 13+14. Options: IV rank + tight spread ────────────────────────────
+        opt       = None
+        iv_rank   = None
         spread_ok = False
 
         if signal != "WAIT":
@@ -388,19 +518,14 @@ def scan(symbol, target_dte, min_adx_val, spy_regime):
                 iv_rank = iv_rank_estimate(tk, opt["iv"])
                 if iv_rank is not None and iv_rank <= 45:
                     score += 1
-                    if score >= 7:
-                        strength, strength_val = "🔥 Strong", 3
-                    elif score >= 5:
-                        strength, strength_val = "⚡ Medium", 2
-
-                # Tight spread check
                 if opt["spread_pct"] < 15:
                     spread_ok = True
                     score += 1
-                    if score >= 7:
-                        strength, strength_val = "🔥 Strong", 3
-                    elif score >= 5:
-                        strength, strength_val = "⚡ Medium", 2
+                # Recalculate strength after options pts
+                if score >= 9:
+                    strength, strength_val = "🔥 Strong", 3
+                elif score >= 6:
+                    strength, strength_val = "⚡ Medium", 2
 
         return {
             "symbol":        symbol,
@@ -412,20 +537,12 @@ def scan(symbol, target_dte, min_adx_val, spy_regime):
             "strength":      strength,
             "strength_val":  strength_val,
             "adx":           adx_val,
-            "squeeze":       squeeze,
-            "macd":          macd_dir,
-            "rsi":           rsi_val,
-            "rsi_ok":        rsi_ok,
             "hv":            hv_val,
             "vol_ratio":     vol_ratio,
-            "spy_aligned":   spy_aligned,
-            "spy_regime":    spy_regime,
-            "earnings_date": str(earnings_date) if earnings_date else None,
-            "days_to_earn":  days_to_earn,
-            "earnings_near": earnings_near,
-            "spread_ok":     spread_ok,
             "opt":           opt,
             "iv_rank":       iv_rank,
+            "spread_ok":     spread_ok,
+            **details,
         }
     except Exception:
         return None
@@ -433,15 +550,20 @@ def scan(symbol, target_dte, min_adx_val, spy_regime):
 
 # ─── SCAN ────────────────────────────────────────────────────────────────────────
 
-spy_regime = get_spy_regime()
-spy_label  = "🐂 Bull Market (SPY above 50 EMA)" if spy_regime == "BULL" else "🐻 Bear Market (SPY below 50 EMA)" if spy_regime == "BEAR" else "❓ Unknown"
-st.info(f"**Market Regime:** {spy_label} — scanner favors {'CALLS' if spy_regime == 'BULL' else 'PUTS' if spy_regime == 'BEAR' else 'both directions'}")
+spy_regime, spy_mom = get_spy_regime()
+spy_ret20           = get_spy_returns()
+spy_label = (
+    f"🐂 Bull Market (SPY +{spy_mom:.1f}% / 20d)" if spy_regime == "BULL"
+    else f"🐻 Bear Market (SPY {spy_mom:.1f}% / 20d)" if spy_regime == "BEAR"
+    else "❓ Unknown Regime"
+)
+st.info(f"**Market Regime:** {spy_label} — scanner favors {'CALLS' if spy_regime=='BULL' else 'PUTS' if spy_regime=='BEAR' else 'both'}")
 
 bar  = st.progress(0, text="Scanning…")
 rows = []
 for i, sym in enumerate(watchlist):
     bar.progress((i + 1) / len(watchlist), text=f"Scanning {sym}…")
-    r = scan(sym, target_dte, min_adx, spy_regime)
+    r = scan(sym, target_dte, min_adx, spy_regime, spy_ret20)
     if r is None:
         continue
     if r["score"] < min_score:
@@ -457,7 +579,6 @@ for i, sym in enumerate(watchlist):
     rows.append(r)
 
 bar.empty()
-
 rows.sort(key=lambda r: (-r["score"], -abs(r["chg"])))
 
 calls = [r for r in rows if r["signal"] == "CALL"]
@@ -490,36 +611,37 @@ def render_table(data):
                else "⚪ WAIT")
 
         flags = []
-        if r["squeeze"]:                      flags.append("🗜 Squeeze")
-        if r["vol_ratio"] >= 1.5:             flags.append(f"📈 Vol {r['vol_ratio']}x")
-        if r["adx"] >= 25:                    flags.append(f"↗ ADX {r['adx']}")
-        if "BULLISH" in r["macd"] or "BEARISH" in r["macd"]: flags.append("✅ MACD")
-        if r["iv_rank"] is not None and r["iv_rank"] <= 30:   flags.append("💰 Low IV")
-        if r["spy_aligned"]:                  flags.append("📊 SPY✓")
-        if r["rsi_ok"]:                       flags.append(f"RSI {r['rsi']}")
-        if r.get("spread_ok"):                flags.append("💸 Tight")
-        if r["earnings_near"]:                flags.append(f"⚠️ Earn {r['days_to_earn']}d")
+        if r.get("confirmed"):           flags.append("✅ Break+")
+        if r.get("ema_stack_full"):      flags.append("📐 EMA✓✓")
+        if r.get("candle_ok"):           flags.append("🕯 Candle✓")
+        if r.get("rs_ok"):               flags.append(f"💪 RS{r['rs_val']:+.1f}%")
+        if r.get("atr_ok"):              flags.append("📡 ATR✓")
+        if r.get("squeeze"):             flags.append("🗜 Squeeze")
+        if r["vol_ratio"] >= 1.5:        flags.append(f"📈 Vol{r['vol_ratio']}x")
+        if r["iv_rank"] is not None and r["iv_rank"] <= 30: flags.append("💰 LowIV")
+        if r.get("earnings_near"):       flags.append(f"⚠️ Earn{r['days_to_earn']}d")
 
         row = {
             "Ticker":     r["symbol"],
             "Price":      f"${r['spot']:.2f}",
             "Chg %":      f"{r['chg']:+.2f}%",
             "Signal":     sig,
-            "Score":      f"{r['score']}/10",
+            "Score":      f"{r['score']}/13",
             "Strength":   r["strength"],
             "ADX":        r["adx"],
-            "RSI":        r["rsi"],
+            "RSI":        r["rsi_val"],
+            "RS vs SPY":  f"{r['rs_val']:+.1f}%" if r.get("rs_val") is not None else "—",
             "Confluence": "  ".join(flags) if flags else "—",
         }
         if opt:
             row.update({
-                "Strike":   f"${opt['strike']:.1f}",
-                "Expiry":   f"{opt['expiry']} ({opt['dte']}d)",
-                "IV":       f"{opt['iv']}%",
-                "IV Rank":  f"{r['iv_rank']:.0f}%" if r["iv_rank"] is not None else "—",
-                "Spread":   f"{opt['spread_pct']:.1f}%",
-                "Mid":      f"${opt['mid']:.2f}",
-                "Vol/OI":   f"{opt['volume']:,} / {opt['oi']:,}",
+                "Strike":  f"${opt['strike']:.1f}",
+                "Expiry":  f"{opt['expiry']} ({opt['dte']}d)",
+                "IV":      f"{opt['iv']}%",
+                "IV Rank": f"{r['iv_rank']:.0f}%" if r["iv_rank"] is not None else "—",
+                "Spread":  f"{opt['spread_pct']:.1f}%",
+                "Mid":     f"${opt['mid']:.2f}",
+                "Vol/OI":  f"{opt['volume']:,} / {opt['oi']:,}",
             })
         else:
             row.update({"Strike":"—","Expiry":"—","IV":"—","IV Rank":"—","Spread":"—","Mid":"—","Vol/OI":"—"})
@@ -553,43 +675,52 @@ with tab4:
         if r:
             opt = r["opt"]
 
-            # Earnings warning banner
             if r["earnings_near"]:
-                st.warning(f"⚠️ **Earnings in {r['days_to_earn']} days ({r['earnings_date']})** — IV may spike before and crush after. Consider waiting or sizing down.")
+                st.warning(f"⚠️ **Earnings in {r['days_to_earn']} days ({r['earnings_date']})** — IV may crush after. Consider waiting or sizing down.")
             elif r["earnings_date"]:
                 st.success(f"✅ Next earnings: {r['earnings_date']} ({r['days_to_earn']} days away) — safe window.")
 
-            # Header metrics
             c1, c2, c3, c4, c5, c6 = st.columns(6)
             c1.metric("Price",   f"${r['spot']:.2f}", f"{r['chg']:+.2f}%",
                       delta_color="normal" if r["chg"] >= 0 else "inverse")
             c2.metric("Signal",  r["signal"])
-            c3.metric("Score",   f"{r['score']}/10")
+            c3.metric("Score",   f"{r['score']}/13")
             c4.metric("ADX",     r["adx"])
-            c5.metric("RSI",     r["rsi"])
-            c6.metric("Regime",  r["spy_regime"])
+            c5.metric("RSI",     r["rsi_val"])
+            c6.metric("RS/SPY",  f"{r['rs_val']:+.1f}%")
 
-            # Confluence checklist
-            st.subheader("✅ Confluence Checklist (10 Factors)")
-            cl1, cl2 = st.columns(2)
-            with cl1:
-                st.markdown(f"{'✅' if r['direction'] != 'NEUTRAL' else '❌'} **Donchian Breakout** — price breaking 20-day {'high' if r['signal']=='CALL' else 'low'}")
-                st.markdown(f"{'✅' if r['adx'] >= min_adx else '❌'} **ADX {r['adx']}** — trend {'confirmed' if r['adx'] >= min_adx else 'weak'}")
-                st.markdown(f"{'✅' if r['squeeze'] else '❌'} **BB Squeeze** — {'coil detected' if r['squeeze'] else 'no squeeze'}")
-                st.markdown(f"{'✅' if 'BULLISH' in r['macd'] or 'BEARISH' in r['macd'] else '❌'} **MACD** — {r['macd'].replace('_',' ').title()}")
+            # ── Checklist ──────────────────────────────────────────────────────
+            st.subheader("✅ Anti-Fakeout Checklist (13 Factors)")
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**📊 Trend & Momentum**")
+                pts = r.get("breakout_pts", 0)
+                conf = "confirmed +0.5% clearance ✓" if r.get("confirmed") else "touched level only" if pts == 1 else "no breakout"
+                st.markdown(f"{'✅' if pts == 2 else '🟡' if pts == 1 else '❌'} **Donchian Breakout** ({pts}/2 pts) — {conf}")
+                eps = r.get("ema_stack_pts", 0)
+                st.markdown(f"{'✅' if r.get('ema_stack_full') else '🟡' if eps == 1 else '❌'} **EMA Stack 10>50>200** ({eps}/2 pts) — {'fully aligned ✓' if r.get('ema_stack_full') else 'partial' if eps == 1 else 'misaligned'}")
+                st.markdown(f"{'✅' if r.get('adx_ok') else '❌'} **ADX {r['adx']}** — trend {'confirmed' if r.get('adx_ok') else 'too weak'}")
+                st.markdown(f"{'✅' if r.get('macd_ok') else '❌'} **MACD** — {r.get('macd_dir','').replace('_',' ').title()}")
                 st.markdown(f"{'✅' if r['vol_ratio'] >= 1.5 else '❌'} **Volume Spike** — {r['vol_ratio']}x average")
-            with cl2:
+                st.markdown(f"{'✅' if r.get('squeeze') else '❌'} **BB Squeeze** — {'coil detected' if r.get('squeeze') else 'no squeeze'}")
+
+            with col2:
+                st.markdown("**🛡️ Anti-Fakeout Filters**")
+                st.markdown(f"{'✅' if r.get('candle_ok') else '❌'} **Candle Quality** — {'strong close, no rejection wick ✓' if r.get('candle_ok') else 'weak/doji candle — fakeout risk'}")
+                st.markdown(f"{'✅' if r.get('rs_ok') else '❌'} **Relative Strength vs SPY** — {r.get('rs_val', 0):+.1f}% {'outperforming ✓' if r.get('rs_ok') and r['signal']=='CALL' else 'underperforming ✓' if r.get('rs_ok') and r['signal']=='PUT' else 'not confirming move'}")
+                st.markdown(f"{'✅' if r.get('atr_ok') else '❌'} **ATR Regime** — {r.get('atr_ratio', 0):.1f}x avg {'— normal volatility ✓' if r.get('atr_ok') else '— SPIKE detected, possible news gap'}")
+                st.markdown(f"{'✅' if r.get('spy_aligned') else '❌'} **SPY Regime {spy_regime}** — {'aligned ✓' if r.get('spy_aligned') else 'fighting the trend'}")
+                st.markdown(f"{'✅' if r.get('rsi_ok') else '❌'} **RSI {r['rsi_val']}** — {'healthy zone ✓' if r.get('rsi_ok') else 'extreme — avoid chasing'}")
                 iv_cheap = r['iv_rank'] is not None and r['iv_rank'] <= 45
-                st.markdown(f"{'✅' if iv_cheap else '❌'} **IV Rank {r['iv_rank'] if r['iv_rank'] is not None else '?'}%** — {'cheap premium ✓' if iv_cheap else 'expensive'}")
-                st.markdown(f"{'✅' if r['rsi_ok'] else '❌'} **RSI {r['rsi']}** — {'healthy zone' if r['rsi_ok'] else 'extreme — avoid'}")
-                st.markdown(f"{'✅' if r['spy_aligned'] else '❌'} **SPY Regime {r['spy_regime']}** — {'aligned ✓' if r['spy_aligned'] else 'fighting the trend'}")
-                st.markdown(f"{'✅' if not r['earnings_near'] else '⚠️'} **Earnings** — {'safe ✓' if not r['earnings_near'] else f\"in {r['days_to_earn']} days — risky\"}")
+                st.markdown(f"{'✅' if iv_cheap else '❌'} **IV Rank {r['iv_rank'] if r['iv_rank'] is not None else '?'}%** — {'cheap premium ✓' if iv_cheap else 'expensive — consider waiting'}")
                 spread_label = f"{opt['spread_pct']:.1f}%" if opt else "—"
-                st.markdown(f"{'✅' if r.get('spread_ok') else '❌'} **Bid/Ask Spread {spread_label}** — {'tight, easy to fill ✓' if r.get('spread_ok') else 'wide — hard to fill'}")
+                st.markdown(f"{'✅' if r.get('spread_ok') else '❌'} **Bid/Ask Spread {spread_label}** — {'fillable ✓' if r.get('spread_ok') else 'wide — hard to fill at mid'}")
+                st.markdown(f"{'✅' if not r['earnings_near'] else '⚠️'} **Earnings** — {'safe window ✓' if not r['earnings_near'] else f\"{r['days_to_earn']}d away — IV crush risk\"}")
 
             st.divider()
 
-            # Contract details
+            # Contract
             st.subheader(f"📝 Recommended Contract — {opt['type']}")
             o1, o2, o3, o4, o5, o6, o7 = st.columns(7)
             o1.metric("Strike",  f"${opt['strike']:.1f}")
@@ -640,23 +771,25 @@ with tab4:
                 f"**Trade idea:** Buy {contracts}× ${opt['strike']} {opt['type']} "
                 f"exp {opt['expiry']} @ ~${mid:.2f}. "
                 f"Stop at 50% loss (${stop_px:.2f}). "
-                f"Take half off at +50% (${tgt1_px:.2f}), rest at +150% (${tgt2_px:.2f})."
+                f"Take half at +50% (${tgt1_px:.2f}), rest at +150% (${tgt2_px:.2f})."
             )
 
-            # Price chart
+            # Chart
             st.divider()
-            st.subheader(f"📈 {chosen} — 6-Month Price + EMAs")
-            tk2  = yf.Ticker(chosen)
+            st.subheader(f"📈 {chosen} — 6-Month Price + EMA Stack")
+            tk2   = yf.Ticker(chosen)
             hist2 = tk2.history(period="6mo")
             if not hist2.empty:
-                hist2["EMA10"] = hist2["Close"].ewm(span=10, adjust=False).mean()
-                hist2["EMA40"] = hist2["Close"].ewm(span=40, adjust=False).mean()
+                hist2["EMA10"]  = hist2["Close"].ewm(span=10,  adjust=False).mean()
+                hist2["EMA50"]  = hist2["Close"].ewm(span=50,  adjust=False).mean()
+                hist2["EMA200"] = hist2["Close"].ewm(span=200, adjust=False).mean()
                 import plotly.graph_objects as go
                 fig = go.Figure()
-                fig.add_trace(go.Scatter(x=hist2.index, y=hist2["Close"], name="Close", line=dict(color="#4CAF50", width=2)))
-                fig.add_trace(go.Scatter(x=hist2.index, y=hist2["EMA10"], name="EMA10", line=dict(color="#2196F3", width=1.5, dash="dot")))
-                fig.add_trace(go.Scatter(x=hist2.index, y=hist2["EMA40"], name="EMA40", line=dict(color="#FF9800", width=1.5, dash="dot")))
-                fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), height=320, legend=dict(orientation="h"))
+                fig.add_trace(go.Scatter(x=hist2.index, y=hist2["Close"],  name="Close",  line=dict(color="#4CAF50", width=2)))
+                fig.add_trace(go.Scatter(x=hist2.index, y=hist2["EMA10"],  name="EMA10",  line=dict(color="#2196F3", width=1.5, dash="dot")))
+                fig.add_trace(go.Scatter(x=hist2.index, y=hist2["EMA50"],  name="EMA50",  line=dict(color="#FF9800", width=1.5, dash="dash")))
+                fig.add_trace(go.Scatter(x=hist2.index, y=hist2["EMA200"], name="EMA200", line=dict(color="#E91E63", width=1.5, dash="longdash")))
+                fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), height=340, legend=dict(orientation="h"))
                 st.plotly_chart(fig, use_container_width=True)
 
 # ─── FOOTER ──────────────────────────────────────────────────────────────────────
