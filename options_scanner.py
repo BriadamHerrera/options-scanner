@@ -39,11 +39,21 @@ ALPACA_SECRET = "BG15va2oxCwjMBKYKhA7a4ysqPGFfV93WVLaKXYqDNFq"
 try:
     from alpaca.data.historical.stock import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
-    from alpaca.data.timeframe import TimeFrame
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
     _alpaca_client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
     ALPACA_OK = True
 except Exception:
     ALPACA_OK = False
+
+# ─── TIMEFRAME CONFIG ────────────────────────────────────────────────────────────
+# Each entry: (label, alpaca_tf, yf_interval, lookback_days, cache_ttl_secs, donchian_period)
+TF_OPTIONS = {
+    "5min":  ("5min",  lambda: TimeFrame(5,  TimeFrameUnit.Minute), "5m",  5,   15,  48),
+    "15min": ("15min", lambda: TimeFrame(15, TimeFrameUnit.Minute), "15m", 15,  30,  32),
+    "1hr":   ("1hr",   lambda: TimeFrame.Hour,                      "1h",  45,  60,  20),
+    "4hr":   ("4hr",   lambda: TimeFrame(4,  TimeFrameUnit.Hour),   "1h",  200, 120, 20),
+    "Daily": ("Daily", lambda: TimeFrame.Day,                       "1d",  730, 300, 20),
+}
 
 # ─── WATCHLIST ───────────────────────────────────────────────────────────────────
 WATCHLIST = [
@@ -72,10 +82,19 @@ st.markdown("""
 st.title("🎯 Options Scanner Pro — Anti-Fakeout v3")
 data_src = "🟢 Alpaca (real-time)" if ALPACA_OK else "🟡 yfinance (delayed)"
 st.caption(f"Price data: {data_src}  ·  Options: yfinance  ·  13-factor anti-fakeout strategy  |  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+# tf_label is set in sidebar — show active timeframe in a badge after sidebar renders
 
 # ─── SIDEBAR ─────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Filters")
+
+    tf_label = st.radio(
+        "⏱ Timeframe",
+        options=list(TF_OPTIONS.keys()),
+        index=4,  # default Daily
+        horizontal=True,
+    )
+    tf_cfg = TF_OPTIONS[tf_label]
 
     custom_input = st.text_input("➕ Add tickers (comma-separated)", placeholder="UBER, ROKU, SNAP")
     watchlist = WATCHLIST.copy()
@@ -115,24 +134,21 @@ with st.sidebar:
 
 # ─── REAL-TIME BAR FETCHER ───────────────────────────────────────────────────────
 
-@st.cache_data(ttl=60, show_spinner=False)  # cache 60s — fresh enough for daily signals
-def fetch_bars(symbol: str) -> pd.DataFrame:
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_bars(symbol: str, tf_label: str) -> pd.DataFrame:
     """
-    Fetch daily OHLCV bars.
-    Primary: Alpaca (real-time, 2 years of daily bars).
-    Fallback: yfinance (delayed).
-    Returns a DataFrame with columns: Open, High, Low, Close, Volume
+    Fetch OHLCV bars for the chosen timeframe.
+    Primary: Alpaca (real-time). Fallback: yfinance (delayed).
     """
+    _, alpaca_tf_fn, yf_interval, lookback_days, _, _ = TF_OPTIONS[tf_label]
     if ALPACA_OK:
         try:
-            from alpaca.data.requests import StockBarsRequest
-            from alpaca.data.timeframe import TimeFrame
-            start = datetime.now(timezone.utc) - timedelta(days=730)
+            start = datetime.now(timezone.utc) - timedelta(days=lookback_days)
             req   = StockBarsRequest(
                 symbol_or_symbols=symbol,
-                timeframe=TimeFrame.Day,
+                timeframe=alpaca_tf_fn(),
                 start=start,
-                feed="iex",  # free IEX feed — real-time
+                feed="iex",
             )
             bars = _alpaca_client.get_stock_bars(req).df
             if isinstance(bars.index, pd.MultiIndex):
@@ -145,10 +161,16 @@ def fetch_bars(symbol: str) -> pd.DataFrame:
                 return bars
         except Exception:
             pass
-    # Fallback to yfinance
+    # Fallback: yfinance (4hr not supported natively — use 1h and resample)
+    period_map = {5: "5d", 15: "15d", 45: "60d", 200: "1y", 730: "2y"}
+    yf_period  = period_map.get(lookback_days, "60d")
     tk   = yf.Ticker(symbol)
-    hist = tk.history(period="2y", interval="1d")
-    return hist[["Open","High","Low","Close","Volume"]].copy()
+    hist = tk.history(period=yf_period, interval=yf_interval)
+    df   = hist[["Open","High","Low","Close","Volume"]].copy()
+    # Resample to 4h if needed
+    if tf_label == "4hr":
+        df = df.resample("4h").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna()
+    return df
 
 
 # ─── INDICATORS ──────────────────────────────────────────────────────────────────
@@ -296,9 +318,9 @@ def historical_vol(close, period=20):
     return float(returns.rolling(period).std().iloc[-1] * np.sqrt(252) * 100)
 
 
-def iv_rank_estimate(symbol, current_iv):
+def iv_rank_estimate(symbol, current_iv, tf_label):
     try:
-        hist = fetch_bars(symbol)
+        hist = fetch_bars(symbol, tf_label)
         if len(hist) < 60:
             return None
         returns   = np.log(hist["Close"] / hist["Close"].shift()).dropna()
@@ -312,24 +334,26 @@ def iv_rank_estimate(symbol, current_iv):
         return None
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def get_spy_regime():
+@st.cache_data(ttl=30, show_spinner=False)
+def get_spy_regime(tf_label: str):
     try:
-        spy   = fetch_bars("SPY")
+        spy   = fetch_bars("SPY", tf_label)
         c     = spy["Close"]
         above = float(c.iloc[-1]) > float(ema(c, 50).iloc[-1])
-        ret20 = (float(c.iloc[-1]) - float(c.iloc[-21])) / float(c.iloc[-21]) * 100
+        lookback = min(20, len(c) - 1)
+        ret20 = (float(c.iloc[-1]) - float(c.iloc[-lookback])) / float(c.iloc[-lookback]) * 100
         return "BULL" if above else "BEAR", round(ret20, 2)
     except Exception:
         return "UNKNOWN", 0.0
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def get_spy_returns():
+@st.cache_data(ttl=30, show_spinner=False)
+def get_spy_returns(tf_label: str):
     try:
-        spy = fetch_bars("SPY")
-        c   = spy["Close"]
-        return (float(c.iloc[-1]) - float(c.iloc[-21])) / float(c.iloc[-21]) * 100
+        spy     = fetch_bars("SPY", tf_label)
+        c       = spy["Close"]
+        lookback = min(20, len(c) - 1)
+        return (float(c.iloc[-1]) - float(c.iloc[-lookback])) / float(c.iloc[-lookback]) * 100
     except Exception:
         return 0.0
 
@@ -406,11 +430,12 @@ def best_contract(ticker_obj, direction, spot, target_dte):
 
 # ─── CORE SCANNER ────────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=60, show_spinner=False)
-def scan(symbol, target_dte, min_adx_val, spy_regime, spy_ret20):
+@st.cache_data(ttl=15, show_spinner=False)
+def scan(symbol, target_dte, min_adx_val, spy_regime, spy_ret20, tf_label):
     try:
-        hist = fetch_bars(symbol)
-        if len(hist) < 210:  # need 200+ for EMA200
+        _, _, _, _, _, don_period = TF_OPTIONS[tf_label]
+        hist = fetch_bars(symbol, tf_label)
+        if len(hist) < 60:  # minimum bars needed
             return None
 
         close  = hist["Close"]
@@ -426,7 +451,7 @@ def scan(symbol, target_dte, min_adx_val, spy_regime, spy_ret20):
         details = {}
 
         # ── 1. Confirmed Donchian breakout (0–2 pts) ─────────────────────────
-        direction, don_score = confirmed_donchian(close, high, low)
+        direction, don_score = confirmed_donchian(close, high, low, period=don_period)
         score += don_score
         details["breakout_pts"] = don_score
         details["confirmed"]    = don_score == 2  # True = cleared 0.5%
@@ -565,7 +590,7 @@ def scan(symbol, target_dte, min_adx_val, spy_regime, spy_ret20):
             yf_tk = yf.Ticker(symbol)  # yfinance only for options chain
             opt = best_contract(yf_tk, direction, spot, target_dte)
             if opt:
-                iv_rank = iv_rank_estimate(symbol, opt["iv"])
+                iv_rank = iv_rank_estimate(symbol, opt["iv"], tf_label)
                 if iv_rank is not None and iv_rank <= 45:
                     score += 1
                 if opt["spread_pct"] < 15:
@@ -600,20 +625,20 @@ def scan(symbol, target_dte, min_adx_val, spy_regime, spy_ret20):
 
 # ─── SCAN ────────────────────────────────────────────────────────────────────────
 
-spy_regime, spy_mom = get_spy_regime()
-spy_ret20           = get_spy_returns()
+spy_regime, spy_mom = get_spy_regime(tf_label)
+spy_ret20           = get_spy_returns(tf_label)
 spy_label = (
     f"🐂 Bull Market (SPY +{spy_mom:.1f}% / 20d)" if spy_regime == "BULL"
     else f"🐻 Bear Market (SPY {spy_mom:.1f}% / 20d)" if spy_regime == "BEAR"
     else "❓ Unknown Regime"
 )
-st.info(f"**Market Regime:** {spy_label} — scanner favors {'CALLS' if spy_regime=='BULL' else 'PUTS' if spy_regime=='BEAR' else 'both'}")
+st.info(f"**Market Regime:** {spy_label} — scanner favors {'CALLS' if spy_regime=='BULL' else 'PUTS' if spy_regime=='BEAR' else 'both'}  |  ⏱ Timeframe: **{tf_label}**")
 
 bar  = st.progress(0, text="Scanning…")
 rows = []
 for i, sym in enumerate(watchlist):
     bar.progress((i + 1) / len(watchlist), text=f"Scanning {sym}…")
-    r = scan(sym, target_dte, min_adx, spy_regime, spy_ret20)
+    r = scan(sym, target_dte, min_adx, spy_regime, spy_ret20, tf_label)
     if r is None:
         continue
     if r["score"] < min_score:
@@ -828,7 +853,7 @@ with tab4:
             # Chart
             st.divider()
             st.subheader(f"📈 {chosen} — 6-Month Price + EMA Stack")
-            hist2 = fetch_bars(chosen)
+            hist2 = fetch_bars(chosen, tf_label)
             if not hist2.empty:
                 hist2["EMA10"]  = hist2["Close"].ewm(span=10,  adjust=False).mean()
                 hist2["EMA50"]  = hist2["Close"].ewm(span=50,  adjust=False).mean()
