@@ -1,4 +1,5 @@
-streamlit==1.50.0
+streamlit==1.45.1
 yfinance==1.2.0
 pandas
 numpy
+altair<5.5
