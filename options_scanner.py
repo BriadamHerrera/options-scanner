@@ -109,6 +109,16 @@ for _k, _v in _DEFAULTS.items():
 with st.sidebar:
     st.header("⚙️ Filters")
 
+    strategy_label = st.radio(
+        "📊 Strategy",
+        ["📈 Trend / Breakout", "🔄 Mean-Reversion"],
+        index=0,
+        help="Trend: buy breakouts, ride momentum (clean trenders like AMD, GOOGL). "
+             "Mean-Reversion: fade oversold/overbought extremes (choppy names like PLTR, NVDA). "
+             "Use the Backtest tab's 'Compare Both' to see which fits a ticker.",
+    )
+    strategy_mode = "mean_reversion" if "Mean" in strategy_label else "trend"
+
     st.caption("**Quick presets**")
     pc1, pc2 = st.columns(2)
     pc1.button("🎯 Swing (1–5d)", use_container_width=True,
@@ -640,13 +650,62 @@ def best_contract(ticker_obj, direction, spot, target_dte):
 
 # ─── CORE SCANNER ────────────────────────────────────────────────────────────────
 
+def _mr_result(symbol, hist, target_dte, tf_label, open_wait_mins):
+    """Build a render-compatible result dict for the Mean-Reversion strategy."""
+    close, high, low, volume = hist["Close"], hist["High"], hist["Low"], hist["Volume"]
+    spot = float(close.iloc[-1]); prev = float(close.iloc[-2])
+    chg  = round((spot - prev) / prev * 100, 2)
+
+    direction, score, rsi2, adx_v = mr_score_at_bar(hist)
+    vol_avg = float(volume.iloc[-21:-1].mean()); vol_ratio = round(float(volume.iloc[-1])/vol_avg, 2) if vol_avg>0 else 1.0
+
+    if direction == "NEUTRAL" or score < 4:
+        signal = "WAIT"
+    elif direction == "BULLISH":
+        signal = "CALL"
+    else:
+        signal = "PUT"
+    if score >= 7:   strength, sval = "🔥 Strong", 3
+    elif score >= 5: strength, sval = "⚡ Medium", 2
+    else:            strength, sval = "💤 Weak", 1
+
+    opt, iv_rank, spread_ok = None, None, False
+    if signal != "WAIT":
+        opt = best_contract(yf.Ticker(symbol), direction, spot, target_dte)
+        if opt:
+            iv_rank = iv_rank_estimate(symbol, opt["iv"], tf_label, open_wait_mins)
+            spread_ok = opt["spread_pct"] < 15
+
+    # earnings (still relevant — avoid IV crush)
+    ed = get_earnings_date(symbol); today = datetime.today().date()
+    dte_e = (ed - today).days if ed else None
+    earn_near = dte_e is not None and 0 <= dte_e <= 5
+
+    return {
+        "symbol":symbol, "spot":spot, "chg":chg, "signal":signal, "direction":direction,
+        "score":score, "score_max":10, "strategy":"mean_reversion",
+        "strength":strength, "strength_val":sval, "adx":adx_v, "hv":0.0,
+        "vol_ratio":vol_ratio, "opt":opt, "iv_rank":iv_rank, "spread_ok":spread_ok,
+        "rsi2":rsi2, "rsi_val":rsi2, "rsi_ok":True,
+        # trend-specific keys → neutral defaults so renderers don't crash
+        "breakout_pts":0, "confirmed":False, "ema_stack_pts":0, "ema_stack_full":False,
+        "adx_ok":(adx_v<25), "squeeze":False, "macd_ok":False, "macd_dir":"NEUTRAL",
+        "candle_ok":False, "rs_ok":False, "rs_val":0.0, "atr_ok":True, "atr_ratio":0.0,
+        "spy_aligned":False, "earnings_date":str(ed) if ed else None,
+        "days_to_earn":dte_e, "earnings_near":earn_near,
+    }
+
+
 @st.cache_data(ttl=15, show_spinner=False)
-def scan(symbol, target_dte, min_adx_val, spy_regime, spy_ret20, tf_label, open_wait_mins=0):
+def scan(symbol, target_dte, min_adx_val, spy_regime, spy_ret20, tf_label, open_wait_mins=0, strategy="trend"):
     try:
         _, _, _, _, _, don_period = TF_OPTIONS[tf_label]
         hist = fetch_bars(symbol, tf_label, open_wait_mins)
         if len(hist) < 60:  # minimum bars needed
             return None
+
+        if strategy == "mean_reversion":
+            return _mr_result(symbol, hist, target_dte, tf_label, open_wait_mins)
 
         close  = hist["Close"]
         high   = hist["High"]
@@ -821,6 +880,8 @@ def scan(symbol, target_dte, min_adx_val, spy_regime, spy_ret20, tf_label, open_
             "signal":        signal,
             "direction":     direction,
             "score":         score,
+            "score_max":     13,
+            "strategy":      "trend",
             "strength":      strength,
             "strength_val":  strength_val,
             "adx":           adx_val,
@@ -845,13 +906,16 @@ spy_label = (
     else "❓ Unknown Regime"
 )
 _open_note = f"  ·  ⏳ skipping first {open_wait_mins} min" if (open_wait_mins and tf_label != "Daily") else ""
-st.info(f"**Market Regime:** {spy_label} — scanner favors {'CALLS' if spy_regime=='BULL' else 'PUTS' if spy_regime=='BEAR' else 'both'}  |  ⏱ Timeframe: **{tf_label}**{_open_note}")
+_strat_badge = "🔄 **Mean-Reversion**" if strategy_mode == "mean_reversion" else "📈 **Trend / Breakout**"
+st.info(f"**Strategy:** {_strat_badge}  |  **Market Regime:** {spy_label}  |  ⏱ **{tf_label}**{_open_note}")
+if strategy_mode == "mean_reversion":
+    st.caption("🔄 Mean-Reversion fades oversold dips / overbought rips. Best on choppy names (PLTR, NVDA). Score is out of 10. Lower your 'Min signal score' to ~5–6 since MR maxes at 10.")
 
 bar  = st.progress(0, text="Scanning…")
 rows = []
 for i, sym in enumerate(watchlist):
     bar.progress((i + 1) / len(watchlist), text=f"Scanning {sym}…")
-    r = scan(sym, target_dte, min_adx, spy_regime, spy_ret20, tf_label, open_wait_mins)
+    r = scan(sym, target_dte, min_adx, spy_regime, spy_ret20, tf_label, open_wait_mins, strategy_mode)
     if r is None:
         continue
     if r["score"] < min_score:
@@ -899,12 +963,17 @@ def render_table(data):
                else "⚪ WAIT")
 
         flags = []
-        if r.get("confirmed"):           flags.append("✅ Break+")
-        if r.get("ema_stack_full"):      flags.append("📐 EMA✓✓")
-        if r.get("candle_ok"):           flags.append("🕯 Candle✓")
-        if r.get("rs_ok"):               flags.append(f"💪 RS{r['rs_val']:+.1f}%")
-        if r.get("atr_ok"):              flags.append("📡 ATR✓")
-        if r.get("squeeze"):             flags.append("🗜 Squeeze")
+        if r.get("strategy") == "mean_reversion":
+            flags.append("🔄 MR")
+            if r.get("rsi2") is not None:    flags.append(f"RSI2 {r['rsi2']:.0f}")
+            if r.get("adx_ok"):              flags.append(f"〰 Choppy(ADX{r['adx']})")
+        else:
+            if r.get("confirmed"):           flags.append("✅ Break+")
+            if r.get("ema_stack_full"):      flags.append("📐 EMA✓✓")
+            if r.get("candle_ok"):           flags.append("🕯 Candle✓")
+            if r.get("rs_ok"):               flags.append(f"💪 RS{r['rs_val']:+.1f}%")
+            if r.get("atr_ok"):              flags.append("📡 ATR✓")
+            if r.get("squeeze"):             flags.append("🗜 Squeeze")
         if r["vol_ratio"] >= 1.5:        flags.append(f"📈 Vol{r['vol_ratio']}x")
         if r["iv_rank"] is not None and r["iv_rank"] <= 30: flags.append("💰 LowIV")
         if r.get("earnings_near"):       flags.append(f"⚠️ Earn{r['days_to_earn']}d")
@@ -914,7 +983,7 @@ def render_table(data):
             "Price":      f"${r['spot']:.2f}",
             "Chg %":      f"{r['chg']:+.2f}%",
             "Signal":     sig,
-            "Score":      f"{r['score']}/13",
+            "Score":      f"{r['score']}/{r.get('score_max',13)}",
             "Strength":   r["strength"],
             "ADX":        r["adx"],
             "RSI":        r["rsi_val"],
@@ -973,40 +1042,57 @@ with tab4:
             c1.metric("Price",   f"${r['spot']:.2f}", f"{r['chg']:+.2f}%",
                       delta_color="normal" if r["chg"] >= 0 else "inverse")
             c2.metric("Signal",  r["signal"])
-            c3.metric("Score",   f"{r['score']}/13")
+            c3.metric("Score",   f"{r['score']}/{r.get('score_max',13)}")
             c4.metric("ADX",     r["adx"])
             c5.metric("RSI",     r["rsi_val"])
             c6.metric("RS/SPY",  f"{r['rs_val']:+.1f}%")
 
             # ── Checklist ──────────────────────────────────────────────────────
-            st.subheader("✅ Anti-Fakeout Checklist (13 Factors)")
-
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("**📊 Trend & Momentum**")
-                pts = r.get("breakout_pts", 0)
-                conf = "confirmed +0.5% clearance ✓" if r.get("confirmed") else "touched level only" if pts == 1 else "no breakout"
-                st.markdown(f"{'✅' if pts == 2 else '🟡' if pts == 1 else '❌'} **Donchian Breakout** ({pts}/2 pts) — {conf}")
-                eps = r.get("ema_stack_pts", 0)
-                st.markdown(f"{'✅' if r.get('ema_stack_full') else '🟡' if eps == 1 else '❌'} **EMA Stack 10>50>200** ({eps}/2 pts) — {'fully aligned ✓' if r.get('ema_stack_full') else 'partial' if eps == 1 else 'misaligned'}")
-                st.markdown(f"{'✅' if r.get('adx_ok') else '❌'} **ADX {r['adx']}** — trend {'confirmed' if r.get('adx_ok') else 'too weak'}")
-                st.markdown(f"{'✅' if r.get('macd_ok') else '❌'} **MACD** — {r.get('macd_dir','').replace('_',' ').title()}")
-                st.markdown(f"{'✅' if r['vol_ratio'] >= 1.5 else '❌'} **Volume Spike** — {r['vol_ratio']}x average")
-                st.markdown(f"{'✅' if r.get('squeeze') else '❌'} **BB Squeeze** — {'coil detected' if r.get('squeeze') else 'no squeeze'}")
-
-            with col2:
-                st.markdown("**🛡️ Anti-Fakeout Filters**")
-                st.markdown(f"{'✅' if r.get('candle_ok') else '❌'} **Candle Quality** — {'strong close, no rejection wick ✓' if r.get('candle_ok') else 'weak/doji candle — fakeout risk'}")
-                st.markdown(f"{'✅' if r.get('rs_ok') else '❌'} **Relative Strength vs SPY** — {r.get('rs_val', 0):+.1f}% {'outperforming ✓' if r.get('rs_ok') and r['signal']=='CALL' else 'underperforming ✓' if r.get('rs_ok') and r['signal']=='PUT' else 'not confirming move'}")
-                st.markdown(f"{'✅' if r.get('atr_ok') else '❌'} **ATR Regime** — {r.get('atr_ratio', 0):.1f}x avg {'— normal volatility ✓' if r.get('atr_ok') else '— SPIKE detected, possible news gap'}")
-                st.markdown(f"{'✅' if r.get('spy_aligned') else '❌'} **SPY Regime {spy_regime}** — {'aligned ✓' if r.get('spy_aligned') else 'fighting the trend'}")
-                st.markdown(f"{'✅' if r.get('rsi_ok') else '❌'} **RSI {r['rsi_val']}** — {'momentum confirmed ✓' if r.get('rsi_ok') else 'momentum against direction'}")
-                iv_cheap = r['iv_rank'] is not None and r['iv_rank'] <= 45
-                st.markdown(f"{'✅' if iv_cheap else '❌'} **IV Rank {r['iv_rank'] if r['iv_rank'] is not None else '?'}%** — {'cheap premium ✓' if iv_cheap else 'expensive — consider waiting'}")
-                spread_label = f"{opt['spread_pct']:.1f}%" if opt else "—"
-                st.markdown(f"{'✅' if r.get('spread_ok') else '❌'} **Bid/Ask Spread {spread_label}** — {'fillable ✓' if r.get('spread_ok') else 'wide — hard to fill at mid'}")
-                earn_txt = "safe window ✓" if not r['earnings_near'] else f"{r['days_to_earn']}d away — IV crush risk"
-                st.markdown(f"{'✅' if not r['earnings_near'] else '⚠️'} **Earnings** — {earn_txt}")
+            if r.get("strategy") == "mean_reversion":
+                st.subheader("✅ Mean-Reversion Checklist")
+                mc1, mc2 = st.columns(2)
+                with mc1:
+                    st.markdown("**🔄 Reversion Setup**")
+                    rsi2v = r.get("rsi2", 50)
+                    st.markdown(f"{'✅' if rsi2v < 10 or rsi2v > 90 else '🟡'} **RSI(2) = {rsi2v}** — {'extreme — snap-back likely ✓' if (rsi2v<10 or rsi2v>90) else 'not yet extreme'}")
+                    st.markdown(f"{'✅' if r.get('adx_ok') else '❌'} **ADX {r['adx']}** — {'choppy regime ✓ (MR works here)' if r.get('adx_ok') else 'trending — MR riskier'}")
+                    st.markdown(f"{'✅' if r['vol_ratio'] >= 1.5 else '⚪'} **Volume {r['vol_ratio']}x** — {'capitulation spike ✓' if r['vol_ratio']>=1.5 else 'normal'}")
+                with mc2:
+                    st.markdown("**💸 Tradeability**")
+                    iv_cheap = r['iv_rank'] is not None and r['iv_rank'] <= 45
+                    st.markdown(f"{'✅' if iv_cheap else '❌'} **IV Rank {r['iv_rank'] if r['iv_rank'] is not None else '?'}%** — {'cheap ✓' if iv_cheap else 'expensive'}")
+                    spread_label = f"{opt['spread_pct']:.1f}%" if opt else "—"
+                    st.markdown(f"{'✅' if r.get('spread_ok') else '❌'} **Spread {spread_label}** — {'fillable ✓' if r.get('spread_ok') else 'wide'}")
+                    earn_txt = "safe ✓" if not r['earnings_near'] else f"{r['days_to_earn']}d — IV crush risk"
+                    st.markdown(f"{'✅' if not r['earnings_near'] else '⚠️'} **Earnings** — {earn_txt}")
+                st.warning("⚠️ Mean-reversion = catching a falling knife. Exit fast at the mean (SMA10), honor the −5% stop. Verify it's a *dip*, not a *collapse*.")
+            else:
+                st.subheader("✅ Anti-Fakeout Checklist (13 Factors)")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("**📊 Trend & Momentum**")
+                    pts = r.get("breakout_pts", 0)
+                    conf = "confirmed +0.5% clearance ✓" if r.get("confirmed") else "touched level only" if pts == 1 else "no breakout"
+                    st.markdown(f"{'✅' if pts == 2 else '🟡' if pts == 1 else '❌'} **Donchian Breakout** ({pts}/2 pts) — {conf}")
+                    eps = r.get("ema_stack_pts", 0)
+                    st.markdown(f"{'✅' if r.get('ema_stack_full') else '🟡' if eps == 1 else '❌'} **EMA Stack 10>50>200** ({eps}/2 pts) — {'fully aligned ✓' if r.get('ema_stack_full') else 'partial' if eps == 1 else 'misaligned'}")
+                    st.markdown(f"{'✅' if r.get('adx_ok') else '❌'} **ADX {r['adx']}** — trend {'confirmed' if r.get('adx_ok') else 'too weak'}")
+                    st.markdown(f"{'✅' if r.get('macd_ok') else '❌'} **MACD** — {r.get('macd_dir','').replace('_',' ').title()}")
+                    st.markdown(f"{'✅' if r['vol_ratio'] >= 1.5 else '❌'} **Volume Spike** — {r['vol_ratio']}x average")
+                    st.markdown(f"{'✅' if r.get('squeeze') else '❌'} **BB Squeeze** — {'coil detected' if r.get('squeeze') else 'no squeeze'}")
+                with col2:
+                    st.markdown("**🛡️ Anti-Fakeout Filters**")
+                    st.markdown(f"{'✅' if r.get('candle_ok') else '❌'} **Candle Quality** — {'strong close, no rejection wick ✓' if r.get('candle_ok') else 'weak/doji candle — fakeout risk'}")
+                    st.markdown(f"{'✅' if r.get('rs_ok') else '❌'} **Relative Strength vs SPY** — {r.get('rs_val', 0):+.1f}% {'outperforming ✓' if r.get('rs_ok') and r['signal']=='CALL' else 'underperforming ✓' if r.get('rs_ok') and r['signal']=='PUT' else 'not confirming move'}")
+                    st.markdown(f"{'✅' if r.get('atr_ok') else '❌'} **ATR Regime** — {r.get('atr_ratio', 0):.1f}x avg {'— normal volatility ✓' if r.get('atr_ok') else '— SPIKE detected, possible news gap'}")
+                    st.markdown(f"{'✅' if r.get('spy_aligned') else '❌'} **SPY Regime {spy_regime}** — {'aligned ✓' if r.get('spy_aligned') else 'fighting the trend'}")
+                    st.markdown(f"{'✅' if r.get('rsi_ok') else '❌'} **RSI {r['rsi_val']}** — {'momentum confirmed ✓' if r.get('rsi_ok') else 'momentum against direction'}")
+                    iv_cheap = r['iv_rank'] is not None and r['iv_rank'] <= 45
+                    st.markdown(f"{'✅' if iv_cheap else '❌'} **IV Rank {r['iv_rank'] if r['iv_rank'] is not None else '?'}%** — {'cheap premium ✓' if iv_cheap else 'expensive — consider waiting'}")
+                    spread_label = f"{opt['spread_pct']:.1f}%" if opt else "—"
+                    st.markdown(f"{'✅' if r.get('spread_ok') else '❌'} **Bid/Ask Spread {spread_label}** — {'fillable ✓' if r.get('spread_ok') else 'wide — hard to fill at mid'}")
+                    earn_txt = "safe window ✓" if not r['earnings_near'] else f"{r['days_to_earn']}d away — IV crush risk"
+                    st.markdown(f"{'✅' if not r['earnings_near'] else '⚠️'} **Earnings** — {earn_txt}")
 
             st.divider()
 
