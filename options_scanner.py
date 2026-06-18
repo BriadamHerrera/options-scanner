@@ -556,7 +556,13 @@ with tab4:
                 # Add EMAs to chart
                 hist["EMA10"] = hist["Close"].ewm(span=10, adjust=False).mean()
                 hist["EMA40"] = hist["Close"].ewm(span=40, adjust=False).mean()
-                st.line_chart(hist[["Close","EMA10","EMA40"]], use_container_width=True)
+                import plotly.graph_objects as go
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=hist.index, y=hist["Close"], name="Close", line=dict(color="#4CAF50", width=2)))
+                fig.add_trace(go.Scatter(x=hist.index, y=hist["EMA10"], name="EMA10", line=dict(color="#2196F3", width=1.5, dash="dot")))
+                fig.add_trace(go.Scatter(x=hist.index, y=hist["EMA40"], name="EMA40", line=dict(color="#FF9800", width=1.5, dash="dot")))
+                fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), height=300, legend=dict(orientation="h"))
+                st.plotly_chart(fig, use_container_width=True)
 
 # ─── FOOTER ──────────────────────────────────────────────────────────────────────
 st.divider()
