@@ -716,7 +716,8 @@ with tab4:
                 st.markdown(f"{'✅' if iv_cheap else '❌'} **IV Rank {r['iv_rank'] if r['iv_rank'] is not None else '?'}%** — {'cheap premium ✓' if iv_cheap else 'expensive — consider waiting'}")
                 spread_label = f"{opt['spread_pct']:.1f}%" if opt else "—"
                 st.markdown(f"{'✅' if r.get('spread_ok') else '❌'} **Bid/Ask Spread {spread_label}** — {'fillable ✓' if r.get('spread_ok') else 'wide — hard to fill at mid'}")
-                st.markdown(f"{'✅' if not r['earnings_near'] else '⚠️'} **Earnings** — {'safe window ✓' if not r['earnings_near'] else f\"{r['days_to_earn']}d away — IV crush risk\"}")
+                earn_txt = "safe window ✓" if not r['earnings_near'] else f"{r['days_to_earn']}d away — IV crush risk"
+                st.markdown(f"{'✅' if not r['earnings_near'] else '⚠️'} **Earnings** — {earn_txt}")
 
             st.divider()
 
