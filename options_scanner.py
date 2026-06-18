@@ -115,6 +115,8 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
     auto_refresh = st.toggle("Auto-refresh every 5 min", value=False)
+    skip_open    = st.toggle("⏳ Skip first 15 min after open", value=True,
+                             help="Ignores the chaotic opening candles (9:30–9:45 ET) on 5min/15min timeframes — they produce the most fakeouts.")
 
     st.divider()
     st.markdown("""
@@ -134,13 +136,29 @@ with st.sidebar:
 
 # ─── REAL-TIME BAR FETCHER ───────────────────────────────────────────────────────
 
+def _drop_opening(df: pd.DataFrame, minutes: int = 15) -> pd.DataFrame:
+    """Drop intraday bars within `minutes` of the 9:30 ET open (the choppiest, fakeout-prone candles)."""
+    if df.empty:
+        return df
+    idx = df.index
+    if idx.tz is None:
+        idx_et = idx.tz_localize("UTC").tz_convert("America/New_York")
+    else:
+        idx_et = idx.tz_convert("America/New_York")
+    mins_since_open = (idx_et.hour - 9) * 60 + (idx_et.minute - 30)
+    keep = ~((mins_since_open >= 0) & (mins_since_open < minutes))
+    return df[keep]
+
+
 @st.cache_data(ttl=15, show_spinner=False)
-def fetch_bars(symbol: str, tf_label: str) -> pd.DataFrame:
+def fetch_bars(symbol: str, tf_label: str, skip_open: bool = False) -> pd.DataFrame:
     """
     Fetch OHLCV bars for the chosen timeframe.
     Primary: Alpaca (real-time). Fallback: yfinance (delayed).
     """
     _, alpaca_tf_fn, yf_interval, lookback_days, _, _ = TF_OPTIONS[tf_label]
+    # Opening filter only meaningful on sub-hourly intraday bars
+    apply_open_filter = skip_open and tf_label in ("5min", "15min")
     if ALPACA_OK:
         try:
             start = datetime.now(timezone.utc) - timedelta(days=lookback_days)
@@ -157,6 +175,8 @@ def fetch_bars(symbol: str, tf_label: str) -> pd.DataFrame:
             bars = bars[["Open","High","Low","Close","Volume"]].copy()
             bars.index = pd.to_datetime(bars.index).tz_localize(None)
             bars.sort_index(inplace=True)
+            if apply_open_filter:
+                bars = _drop_opening(bars, 15)
             if len(bars) >= 60:
                 return bars
         except Exception:
@@ -170,6 +190,8 @@ def fetch_bars(symbol: str, tf_label: str) -> pd.DataFrame:
     # Resample to 4h if needed
     if tf_label == "4hr":
         df = df.resample("4h").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna()
+    if apply_open_filter:
+        df = _drop_opening(df, 15)
     return df
 
 
@@ -318,9 +340,9 @@ def historical_vol(close, period=20):
     return float(returns.rolling(period).std().iloc[-1] * np.sqrt(252) * 100)
 
 
-def iv_rank_estimate(symbol, current_iv, tf_label):
+def iv_rank_estimate(symbol, current_iv, tf_label, skip_open=False):
     try:
-        hist = fetch_bars(symbol, tf_label)
+        hist = fetch_bars(symbol, tf_label, skip_open)
         if len(hist) < 60:
             return None
         returns   = np.log(hist["Close"] / hist["Close"].shift()).dropna()
@@ -335,9 +357,9 @@ def iv_rank_estimate(symbol, current_iv, tf_label):
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def get_spy_regime(tf_label: str):
+def get_spy_regime(tf_label: str, skip_open: bool = False):
     try:
-        spy   = fetch_bars("SPY", tf_label)
+        spy   = fetch_bars("SPY", tf_label, skip_open)
         c     = spy["Close"]
         above = float(c.iloc[-1]) > float(ema(c, 50).iloc[-1])
         lookback = min(20, len(c) - 1)
@@ -348,9 +370,9 @@ def get_spy_regime(tf_label: str):
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def get_spy_returns(tf_label: str):
+def get_spy_returns(tf_label: str, skip_open: bool = False):
     try:
-        spy     = fetch_bars("SPY", tf_label)
+        spy     = fetch_bars("SPY", tf_label, skip_open)
         c       = spy["Close"]
         lookback = min(20, len(c) - 1)
         return (float(c.iloc[-1]) - float(c.iloc[-lookback])) / float(c.iloc[-lookback]) * 100
@@ -431,10 +453,10 @@ def best_contract(ticker_obj, direction, spot, target_dte):
 # ─── CORE SCANNER ────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=15, show_spinner=False)
-def scan(symbol, target_dte, min_adx_val, spy_regime, spy_ret20, tf_label):
+def scan(symbol, target_dte, min_adx_val, spy_regime, spy_ret20, tf_label, skip_open=False):
     try:
         _, _, _, _, _, don_period = TF_OPTIONS[tf_label]
-        hist = fetch_bars(symbol, tf_label)
+        hist = fetch_bars(symbol, tf_label, skip_open)
         if len(hist) < 60:  # minimum bars needed
             return None
 
@@ -590,7 +612,7 @@ def scan(symbol, target_dte, min_adx_val, spy_regime, spy_ret20, tf_label):
             yf_tk = yf.Ticker(symbol)  # yfinance only for options chain
             opt = best_contract(yf_tk, direction, spot, target_dte)
             if opt:
-                iv_rank = iv_rank_estimate(symbol, opt["iv"], tf_label)
+                iv_rank = iv_rank_estimate(symbol, opt["iv"], tf_label, skip_open)
                 if iv_rank is not None and iv_rank <= 45:
                     score += 1
                 if opt["spread_pct"] < 15:
@@ -625,20 +647,21 @@ def scan(symbol, target_dte, min_adx_val, spy_regime, spy_ret20, tf_label):
 
 # ─── SCAN ────────────────────────────────────────────────────────────────────────
 
-spy_regime, spy_mom = get_spy_regime(tf_label)
-spy_ret20           = get_spy_returns(tf_label)
+spy_regime, spy_mom = get_spy_regime(tf_label, skip_open)
+spy_ret20           = get_spy_returns(tf_label, skip_open)
 spy_label = (
     f"🐂 Bull Market (SPY +{spy_mom:.1f}% / 20d)" if spy_regime == "BULL"
     else f"🐻 Bear Market (SPY {spy_mom:.1f}% / 20d)" if spy_regime == "BEAR"
     else "❓ Unknown Regime"
 )
-st.info(f"**Market Regime:** {spy_label} — scanner favors {'CALLS' if spy_regime=='BULL' else 'PUTS' if spy_regime=='BEAR' else 'both'}  |  ⏱ Timeframe: **{tf_label}**")
+_open_note = "  ·  ⏳ skipping first 15 min" if (skip_open and tf_label in ("5min","15min")) else ""
+st.info(f"**Market Regime:** {spy_label} — scanner favors {'CALLS' if spy_regime=='BULL' else 'PUTS' if spy_regime=='BEAR' else 'both'}  |  ⏱ Timeframe: **{tf_label}**{_open_note}")
 
 bar  = st.progress(0, text="Scanning…")
 rows = []
 for i, sym in enumerate(watchlist):
     bar.progress((i + 1) / len(watchlist), text=f"Scanning {sym}…")
-    r = scan(sym, target_dte, min_adx, spy_regime, spy_ret20, tf_label)
+    r = scan(sym, target_dte, min_adx, spy_regime, spy_ret20, tf_label, skip_open)
     if r is None:
         continue
     if r["score"] < min_score:
@@ -853,7 +876,7 @@ with tab4:
             # Chart
             st.divider()
             st.subheader(f"📈 {chosen} — 6-Month Price + EMA Stack")
-            hist2 = fetch_bars(chosen, tf_label)
+            hist2 = fetch_bars(chosen, tf_label, skip_open)
             if not hist2.empty:
                 hist2["EMA10"]  = hist2["Close"].ewm(span=10,  adjust=False).mean()
                 hist2["EMA50"]  = hist2["Close"].ewm(span=50,  adjust=False).mean()
