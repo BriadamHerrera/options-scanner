@@ -395,7 +395,7 @@ def _score_at_bar(window, spy_window, min_adx_val):
     vavg = float(vol.iloc[-21:-1].mean()); vr = float(vol.iloc[-1])/vavg if vavg>0 else 1.0
     if vr >= 1.5:
         score += 1
-    bc, brc = candle_quality(close.iloc[-1], open_.iloc[-1], high.iloc[-1], low.iloc[-1])
+    bc, brc = candle_quality(close, open_, high, low)
     if (direction=="BULLISH" and bc) or (direction=="BEARISH" and brc):
         score += 1
     sret = (float(close.iloc[-1])-float(close.iloc[-21]))/float(close.iloc[-21])*100
