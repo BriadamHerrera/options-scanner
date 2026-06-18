@@ -29,8 +29,21 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import time
+
+# ─── ALPACA REAL-TIME DATA ───────────────────────────────────────────────────────
+ALPACA_KEY    = "PK37N65ATHZ2OTOR25L3U2WSXP"
+ALPACA_SECRET = "BG15va2oxCwjMBKYKhA7a4ysqPGFfV93WVLaKXYqDNFq"
+
+try:
+    from alpaca.data.historical.stock import StockHistoricalDataClient
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+    _alpaca_client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
+    ALPACA_OK = True
+except Exception:
+    ALPACA_OK = False
 
 # ─── WATCHLIST ───────────────────────────────────────────────────────────────────
 WATCHLIST = [
@@ -57,7 +70,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("🎯 Options Scanner Pro — Anti-Fakeout v3")
-st.caption(f"13-factor strategy with fakeout filters: EMA stack · Candle quality · Rel. Strength · ATR regime · Confirmed breakout  |  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+data_src = "🟢 Alpaca (real-time)" if ALPACA_OK else "🟡 yfinance (delayed)"
+st.caption(f"Price data: {data_src}  ·  Options: yfinance  ·  13-factor anti-fakeout strategy  |  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # ─── SIDEBAR ─────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -97,6 +111,44 @@ with st.sidebar:
 - ⚡ 6–8  → Medium
 - 💤 3–5  → Weak
     """)
+
+
+# ─── REAL-TIME BAR FETCHER ───────────────────────────────────────────────────────
+
+@st.cache_data(ttl=60, show_spinner=False)  # cache 60s — fresh enough for daily signals
+def fetch_bars(symbol: str) -> pd.DataFrame:
+    """
+    Fetch daily OHLCV bars.
+    Primary: Alpaca (real-time, 2 years of daily bars).
+    Fallback: yfinance (delayed).
+    Returns a DataFrame with columns: Open, High, Low, Close, Volume
+    """
+    if ALPACA_OK:
+        try:
+            from alpaca.data.requests import StockBarsRequest
+            from alpaca.data.timeframe import TimeFrame
+            start = datetime.now(timezone.utc) - timedelta(days=730)
+            req   = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=TimeFrame.Day,
+                start=start,
+                feed="iex",  # free IEX feed — real-time
+            )
+            bars = _alpaca_client.get_stock_bars(req).df
+            if isinstance(bars.index, pd.MultiIndex):
+                bars = bars.xs(symbol, level="symbol") if symbol in bars.index.get_level_values("symbol") else bars.droplevel(0)
+            bars = bars.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
+            bars = bars[["Open","High","Low","Close","Volume"]].copy()
+            bars.index = pd.to_datetime(bars.index).tz_localize(None)
+            bars.sort_index(inplace=True)
+            if len(bars) >= 60:
+                return bars
+        except Exception:
+            pass
+    # Fallback to yfinance
+    tk   = yf.Ticker(symbol)
+    hist = tk.history(period="2y", interval="1d")
+    return hist[["Open","High","Low","Close","Volume"]].copy()
 
 
 # ─── INDICATORS ──────────────────────────────────────────────────────────────────
@@ -244,9 +296,9 @@ def historical_vol(close, period=20):
     return float(returns.rolling(period).std().iloc[-1] * np.sqrt(252) * 100)
 
 
-def iv_rank_estimate(ticker_obj, current_iv):
+def iv_rank_estimate(symbol, current_iv):
     try:
-        hist = ticker_obj.history(period="1y")
+        hist = fetch_bars(symbol)
         if len(hist) < 60:
             return None
         returns   = np.log(hist["Close"] / hist["Close"].shift()).dropna()
@@ -260,24 +312,22 @@ def iv_rank_estimate(ticker_obj, current_iv):
         return None
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def get_spy_regime():
     try:
-        spy  = yf.Ticker("SPY").history(period="1y")
-        c    = spy["Close"]
+        spy   = fetch_bars("SPY")
+        c     = spy["Close"]
         above = float(c.iloc[-1]) > float(ema(c, 50).iloc[-1])
-        # Also check 20-day return for momentum
         ret20 = (float(c.iloc[-1]) - float(c.iloc[-21])) / float(c.iloc[-21]) * 100
         return "BULL" if above else "BEAR", round(ret20, 2)
     except Exception:
         return "UNKNOWN", 0.0
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def get_spy_returns():
-    """20-day return for SPY — used for relative strength comparison."""
     try:
-        spy = yf.Ticker("SPY").history(period="3mo")
+        spy = fetch_bars("SPY")
         c   = spy["Close"]
         return (float(c.iloc[-1]) - float(c.iloc[-21])) / float(c.iloc[-21]) * 100
     except Exception:
@@ -356,11 +406,10 @@ def best_contract(ticker_obj, direction, spot, target_dte):
 
 # ─── CORE SCANNER ────────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def scan(symbol, target_dte, min_adx_val, spy_regime, spy_ret20):
     try:
-        tk   = yf.Ticker(symbol)
-        hist = tk.history(period="2y", interval="1d")
+        hist = fetch_bars(symbol)
         if len(hist) < 210:  # need 200+ for EMA200
             return None
 
@@ -513,9 +562,10 @@ def scan(symbol, target_dte, min_adx_val, spy_regime, spy_ret20):
         spread_ok = False
 
         if signal != "WAIT":
-            opt = best_contract(tk, direction, spot, target_dte)
+            yf_tk = yf.Ticker(symbol)  # yfinance only for options chain
+            opt = best_contract(yf_tk, direction, spot, target_dte)
             if opt:
-                iv_rank = iv_rank_estimate(tk, opt["iv"])
+                iv_rank = iv_rank_estimate(symbol, opt["iv"])
                 if iv_rank is not None and iv_rank <= 45:
                     score += 1
                 if opt["spread_pct"] < 15:
@@ -778,8 +828,7 @@ with tab4:
             # Chart
             st.divider()
             st.subheader(f"📈 {chosen} — 6-Month Price + EMA Stack")
-            tk2   = yf.Ticker(chosen)
-            hist2 = tk2.history(period="6mo")
+            hist2 = fetch_bars(chosen)
             if not hist2.empty:
                 hist2["EMA10"]  = hist2["Close"].ewm(span=10,  adjust=False).mean()
                 hist2["EMA50"]  = hist2["Close"].ewm(span=50,  adjust=False).mean()
