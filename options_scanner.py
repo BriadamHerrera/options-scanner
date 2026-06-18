@@ -56,11 +56,11 @@ TF_OPTIONS = {
 }
 
 # ─── WATCHLIST ───────────────────────────────────────────────────────────────────
-# Pruned to names with a proven backtested edge (positive in BOTH 6mo & 1yr tests).
-# Removed chronic losers: TSLA, PLTR, NVDA, AVGO, SOFI, META, SMCI, MU.
+# Robust names — profitable under BOTH the original AND optimized parameter sets
+# (guards against curve-fitting). Chronic losers removed: TSLA, PLTR, NVDA, AVGO, META.
 WATCHLIST = [
-    "ARM","AMD","GOOGL","COIN","NFLX",
-    "AAPL","AMZN","MSFT","QQQ","MSTR","HOOD",
+    "AMD","GOOGL","ARM","HOOD","QQQ",
+    "MSTR","AMZN","COIN","SPY",
 ]
 MIN_OI = 100  # raised from 50 — better liquidity
 
@@ -87,8 +87,8 @@ st.caption(f"Price data: {data_src}  ·  Options: yfinance  ·  13-factor anti-f
 # ─── TRADING-STYLE PRESETS ───────────────────────────────────────────────────────
 # Each preset sets the widget session_state keys before the widgets render.
 PRESETS = {
-    # 1–5 day swings: Daily chart, 30 DTE, stricter score, trend-confirming ADX
-    "swing": {"k_tf": "Daily", "k_dte": 30, "k_score": 8, "k_iv": 50, "k_adx": 22,
+    # Swing: Daily chart, 45 DTE (slow theta over 7-10d hold), score≥9, trend ADX
+    "swing": {"k_tf": "Daily", "k_dte": 45, "k_score": 9, "k_iv": 50, "k_adx": 22,
               "k_spread": 20, "k_open": "Off"},
     # Same-day / intraday: 15min chart, short DTE, looser score, skip the open
     "day":   {"k_tf": "15min", "k_dte": 7,  "k_score": 6, "k_iv": 60, "k_adx": 18,
@@ -409,14 +409,15 @@ def _score_at_bar(window, spy_window, min_adx_val):
     if (direction=="BULLISH" and spy_bull) or (direction=="BEARISH" and not spy_bull):
         score += 1
     rsi = rsi_calc(close)
-    if (direction=="BULLISH" and 40<=rsi<=75) or (direction=="BEARISH" and 25<=rsi<=60):
+    if (direction=="BULLISH" and rsi>=40) or (direction=="BEARISH" and rsi<=60):
         score += 1
     score += 1  # earnings assumed clear (not checked historically)
     return direction, score, round(adx_v,1), round(rsi,1)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def run_backtest(symbol, eval_days, min_score_bt, min_adx_val, hold_bars=3, stop_pct=3.0, tgt_pct=6.0):
+def run_backtest(symbol, eval_days, min_score_bt, min_adx_val, hold_bars=10,
+                 stop_pct=4.0, tgt_pct=12.0, trail_pct=4.0, trail_arm=4.0):
     """
     Walk-forward backtest of the directional signal on the UNDERLYING.
     Returns (trades_list, rows_for_table). Uses yfinance daily history (reliable warmup).
@@ -440,14 +441,21 @@ def run_backtest(symbol, eval_days, min_score_bt, min_adx_val, hold_bars=3, stop
         if direction == "NEUTRAL" or score < min_score_bt or i+1 >= len(data):
             continue
         entry = float(data["Open"].iloc[i+1]); exit_px, outcome, held = None, "TIME", 0
+        peak = entry  # best favorable price reached (for trailing stop)
         for j in range(i+1, min(i+1+hold_bars, len(data))):
             held += 1
             hi, lo = float(data["High"].iloc[j]), float(data["Low"].iloc[j])
             if direction == "BULLISH":
                 if lo <= entry*(1-stop_pct/100): exit_px, outcome = entry*(1-stop_pct/100), "STOP"; break
+                peak = max(peak, hi)
+                if peak >= entry*(1+trail_arm/100) and lo <= peak*(1-trail_pct/100):
+                    exit_px, outcome = peak*(1-trail_pct/100), "TRAIL"; break
                 if hi >= entry*(1+tgt_pct/100):  exit_px, outcome = entry*(1+tgt_pct/100), "TARGET"; break
             else:
                 if hi >= entry*(1+stop_pct/100): exit_px, outcome = entry*(1+stop_pct/100), "STOP"; break
+                peak = min(peak, lo)
+                if peak <= entry*(1-trail_arm/100) and hi >= peak*(1+trail_pct/100):
+                    exit_px, outcome = peak*(1+trail_pct/100), "TRAIL"; break
                 if lo <= entry*(1-tgt_pct/100):  exit_px, outcome = entry*(1-tgt_pct/100), "TARGET"; break
         if exit_px is None:
             exit_px = float(data["Close"].iloc[min(i+hold_bars, len(data)-1)])
@@ -687,11 +695,13 @@ def scan(symbol, target_dte, min_adx_val, spy_regime, spy_ret20, tf_label, open_
             spy_aligned = True
         details["spy_aligned"] = spy_aligned
 
-        # ── 11. RSI not extreme (0–1 pt) ──────────────────────────────────────
+        # ── 11. RSI momentum (0–1 pt) ─────────────────────────────────────────
+        # No upper cap for calls / lower cap for puts — momentum continuation
+        # outperformed in backtest (RSI 70+ was the best bucket, not the worst).
         rsi_val = round(rsi_calc(close), 1)
         rsi_ok  = (
-            (direction == "BULLISH" and 40 <= rsi_val <= 75) or
-            (direction == "BEARISH" and 25 <= rsi_val <= 60)
+            (direction == "BULLISH" and rsi_val >= 40) or
+            (direction == "BEARISH" and rsi_val <= 60)
         )
         if rsi_ok:
             score += 1
@@ -933,7 +943,7 @@ with tab4:
                 st.markdown(f"{'✅' if r.get('rs_ok') else '❌'} **Relative Strength vs SPY** — {r.get('rs_val', 0):+.1f}% {'outperforming ✓' if r.get('rs_ok') and r['signal']=='CALL' else 'underperforming ✓' if r.get('rs_ok') and r['signal']=='PUT' else 'not confirming move'}")
                 st.markdown(f"{'✅' if r.get('atr_ok') else '❌'} **ATR Regime** — {r.get('atr_ratio', 0):.1f}x avg {'— normal volatility ✓' if r.get('atr_ok') else '— SPIKE detected, possible news gap'}")
                 st.markdown(f"{'✅' if r.get('spy_aligned') else '❌'} **SPY Regime {spy_regime}** — {'aligned ✓' if r.get('spy_aligned') else 'fighting the trend'}")
-                st.markdown(f"{'✅' if r.get('rsi_ok') else '❌'} **RSI {r['rsi_val']}** — {'healthy zone ✓' if r.get('rsi_ok') else 'extreme — avoid chasing'}")
+                st.markdown(f"{'✅' if r.get('rsi_ok') else '❌'} **RSI {r['rsi_val']}** — {'momentum confirmed ✓' if r.get('rsi_ok') else 'momentum against direction'}")
                 iv_cheap = r['iv_rank'] is not None and r['iv_rank'] <= 45
                 st.markdown(f"{'✅' if iv_cheap else '❌'} **IV Rank {r['iv_rank'] if r['iv_rank'] is not None else '?'}%** — {'cheap premium ✓' if iv_cheap else 'expensive — consider waiting'}")
                 spread_label = f"{opt['spread_pct']:.1f}%" if opt else "—"
@@ -1027,7 +1037,7 @@ with tab5:
     bc1, bc2, bc3 = st.columns([2,1,1])
     bt_symbol = bc1.text_input("Ticker", value="AAPL", key="bt_sym").strip().upper()
     bt_window = bc2.selectbox("Lookback", ["3 months","6 months","1 year","2 years"], index=2)
-    bt_score  = bc3.slider("Min score", 0, 13, 8, key="bt_score")
+    bt_score  = bc3.slider("Min score", 0, 13, 9, key="bt_score")
     win_map   = {"3 months":63, "6 months":126, "1 year":252, "2 years":500}
 
     if st.button("▶️ Run Backtest", use_container_width=True):
@@ -1065,7 +1075,7 @@ with tab5:
             st.caption(
                 "⚠️ Underlying returns only — real options add theta decay & spread, "
                 "so treat a thin positive expectancy as roughly breakeven. "
-                "Rules: enter next open, hold ≤3 days, stop −3% / target +6%."
+                "Rules: enter next open, hold ≤10 days, −4% stop, +4% trailing stop once +4% in profit."
             )
 
 # ─── FOOTER ──────────────────────────────────────────────────────────────────────

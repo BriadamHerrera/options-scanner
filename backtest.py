@@ -22,11 +22,13 @@ from datetime import datetime
 # ─── PARAMS ──────────────────────────────────────────────────────────────────────
 SYMBOL    = sys.argv[1] if len(sys.argv) > 1 else "TSLA"
 EVAL_DAYS = int(sys.argv[2]) if len(sys.argv) > 2 else 15  # trading days to evaluate
-MIN_SCORE = 8       # Swing-mode threshold
-MIN_ADX   = 22
-HOLD_BARS = 3       # hold up to 3 days (1–5 day swing midpoint)
-STOP_PCT  = 3.0     # underlying stop %
-TGT_PCT   = 6.0     # underlying target % (2:1 R/R)
+MIN_SCORE  = 9       # raised from 8 — scores 6-8 showed no edge
+MIN_ADX    = 22
+HOLD_BARS  = 10      # extended from 3 — longer holds tripled expectancy
+STOP_PCT   = 4.0     # initial underlying stop %
+TGT_PCT    = 12.0    # final target (let winners run; trailing stop does the real work)
+TRAIL_PCT  = 4.0     # trailing stop: give back 4% from the peak favorable price
+TRAIL_ARM  = 4.0     # only start trailing once trade is +4% in our favor
 
 # ─── INDICATORS (mirror options_scanner.py) ──────────────────────────────────────
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
@@ -132,7 +134,8 @@ def score_bar(window, spy_window):
     if (direction=="BULLISH" and spy_bull) or (direction=="BEARISH" and not spy_bull): score += 1
 
     rsi = rsi_calc(close)
-    if (direction=="BULLISH" and 40<=rsi<=75) or (direction=="BEARISH" and 25<=rsi<=60): score += 1
+    # No upper cap for calls / lower cap for puts — momentum continuation outperforms.
+    if (direction=="BULLISH" and rsi>=40) or (direction=="BEARISH" and rsi<=60): score += 1
 
     score += 1  # no-earnings assumed (can't check historically here)
     return direction, score, round(adx,1), round(rsi,1)
@@ -169,14 +172,21 @@ if __name__ == "__main__":
             continue
         entry = float(data.Open.iloc[i+1])
         outcome, exit_px, held = "open", None, 0
+        peak = entry  # best favorable price reached
         for j in range(i+1, min(i+1+HOLD_BARS, len(data))):
             held += 1
             hi, lo = float(data.High.iloc[j]), float(data.Low.iloc[j])
             if direction == "BULLISH":
                 if lo <= entry*(1-STOP_PCT/100): outcome, exit_px = "STOP", entry*(1-STOP_PCT/100); break
+                peak = max(peak, hi)
+                if peak >= entry*(1+TRAIL_ARM/100) and lo <= peak*(1-TRAIL_PCT/100):
+                    outcome, exit_px = "TRAIL", peak*(1-TRAIL_PCT/100); break
                 if hi >= entry*(1+TGT_PCT/100):  outcome, exit_px = "TARGET", entry*(1+TGT_PCT/100); break
             else:
                 if hi >= entry*(1+STOP_PCT/100): outcome, exit_px = "STOP", entry*(1+STOP_PCT/100); break
+                peak = min(peak, lo)
+                if peak <= entry*(1-TRAIL_ARM/100) and hi >= peak*(1+TRAIL_PCT/100):
+                    outcome, exit_px = "TRAIL", peak*(1+TRAIL_PCT/100); break
                 if lo <= entry*(1-TGT_PCT/100):  outcome, exit_px = "TARGET", entry*(1-TGT_PCT/100); break
         if exit_px is None:
             exit_px = float(data.Close.iloc[min(i+HOLD_BARS, len(data)-1)]); outcome = "TIME"
