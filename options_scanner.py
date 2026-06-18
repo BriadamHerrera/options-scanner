@@ -56,7 +56,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🎯 Options Scanner Pro — Anti-Fakeout Edition")
+st.title("🎯 Options Scanner Pro — Anti-Fakeout v3")
 st.caption(f"13-factor strategy with fakeout filters: EMA stack · Candle quality · Rel. Strength · ATR regime · Confirmed breakout  |  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # ─── SIDEBAR ─────────────────────────────────────────────────────────────────────
