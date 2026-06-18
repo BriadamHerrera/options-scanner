@@ -373,6 +373,44 @@ def historical_vol(close, period=20):
     return float(returns.rolling(period).std().iloc[-1] * np.sqrt(252) * 100)
 
 
+# ─── MEAN-REVERSION SCORING ──────────────────────────────────────────────────────
+
+def mr_score_at_bar(window):
+    """Mean-reversion: buy oversold dips in uptrends / fade overbought rips. Score 0–10."""
+    close, high, low, vol = window["Close"], window["High"], window["Low"], window["Volume"]
+    c = float(close.iloc[-1])
+    sma20 = float(sma(close,20).iloc[-1]); std20 = float(close.rolling(20).std().iloc[-1])
+    sma200 = float(sma(close,200).iloc[-1]) if len(close) >= 200 else sma20
+    if std20 == 0:
+        return "NEUTRAL", 0, 50.0, 0.0
+    z = (c - sma20)/std20
+    rsi2  = float(rsi_calc(close, 2)); rsi14 = float(rsi_calc(close, 14))
+    adx_v, _, _ = adx_calc(high, low, close)
+
+    oversold   = rsi2 < 10 or z < -2
+    overbought = rsi2 > 90 or z > 2
+    if   oversold   and c > sma200: direction = "BULLISH"
+    elif overbought and c < sma200: direction = "BEARISH"
+    elif oversold:                  direction = "BULLISH"
+    elif overbought:                direction = "BEARISH"
+    else:
+        return "NEUTRAL", 0, round(rsi2,1), round(adx_v,1)
+
+    score = 0
+    if (direction=="BULLISH" and rsi2<10) or (direction=="BEARISH" and rsi2>90): score += 2
+    lower, upper = sma20-2.5*std20, sma20+2.5*std20
+    if (direction=="BULLISH" and c<lower) or (direction=="BEARISH" and c>upper): score += 2
+    if abs(z) >= 2: score += 1
+    if adx_v < 25: score += 1
+    if (direction=="BULLISH" and rsi14<30) or (direction=="BEARISH" and rsi14>70): score += 1
+    diffs = close.diff().iloc[-3:]
+    if (direction=="BULLISH" and (diffs<0).all()) or (direction=="BEARISH" and (diffs>0).all()): score += 1
+    if (direction=="BULLISH" and c>sma200) or (direction=="BEARISH" and c<sma200): score += 1
+    vavg = float(vol.iloc[-21:-1].mean()); vr = float(vol.iloc[-1])/vavg if vavg>0 else 1.0
+    if vr >= 1.5: score += 1
+    return direction, score, round(rsi2,1), round(adx_v,1)
+
+
 # ─── BACKTEST ENGINE ─────────────────────────────────────────────────────────────
 
 def _score_at_bar(window, spy_window, min_adx_val):
@@ -417,10 +455,11 @@ def _score_at_bar(window, spy_window, min_adx_val):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def run_backtest(symbol, eval_days, min_score_bt, min_adx_val, hold_bars=10,
-                 stop_pct=4.0, tgt_pct=12.0, trail_pct=4.0, trail_arm=4.0):
+                 stop_pct=4.0, tgt_pct=12.0, trail_pct=4.0, trail_arm=4.0,
+                 strategy="trend"):
     """
-    Walk-forward backtest of the directional signal on the UNDERLYING.
-    Returns (trades_list, rows_for_table). Uses yfinance daily history (reliable warmup).
+    Walk-forward backtest on the UNDERLYING. strategy = "trend" or "mean_reversion".
+    Returns (trades_list, rows_for_table). Uses yfinance daily history.
     """
     try:
         data = yf.Ticker(symbol).history(period="2y")[["Open","High","Low","Close","Volume"]]
@@ -433,38 +472,56 @@ def run_backtest(symbol, eval_days, min_score_bt, min_adx_val, hold_bars=10,
     if len(data) < 230:
         return None, None
 
+    is_mr   = strategy == "mean_reversion"
+    max_sc  = 10 if is_mr else 13
+    mr_stop = 5.0   # mean-reversion knife-protection stop
+    mr_hold = 7     # mean-reversion holds shorter
     start = len(data) - eval_days
     trades, table = [], []
     for i in range(max(start, 220), len(data)):
         w, sw = data.iloc[:i+1], spy.iloc[:i+1]
-        direction, score, adx_v, rsi = _score_at_bar(w, sw, min_adx_val)
+        if is_mr:
+            direction, score, rsi, adx_v = mr_score_at_bar(w)
+        else:
+            direction, score, adx_v, rsi = _score_at_bar(w, sw, min_adx_val)
         if direction == "NEUTRAL" or score < min_score_bt or i+1 >= len(data):
             continue
         entry = float(data["Open"].iloc[i+1]); exit_px, outcome, held = None, "TIME", 0
-        peak = entry  # best favorable price reached (for trailing stop)
-        for j in range(i+1, min(i+1+hold_bars, len(data))):
+        peak = entry
+        hb = mr_hold if is_mr else hold_bars
+        for j in range(i+1, min(i+1+hb, len(data))):
             held += 1
-            hi, lo = float(data["High"].iloc[j]), float(data["Low"].iloc[j])
-            if direction == "BULLISH":
-                if lo <= entry*(1-stop_pct/100): exit_px, outcome = entry*(1-stop_pct/100), "STOP"; break
-                peak = max(peak, hi)
-                if peak >= entry*(1+trail_arm/100) and lo <= peak*(1-trail_pct/100):
-                    exit_px, outcome = peak*(1-trail_pct/100), "TRAIL"; break
-                if hi >= entry*(1+tgt_pct/100):  exit_px, outcome = entry*(1+tgt_pct/100), "TARGET"; break
+            hi, lo, cl = float(data["High"].iloc[j]), float(data["Low"].iloc[j]), float(data["Close"].iloc[j])
+            if is_mr:
+                # Mean-reversion: exit on revert to SMA10, stop on further extension
+                mean_now = float(sma(data["Close"].iloc[:j+1], 10).iloc[-1])
+                if direction == "BULLISH":
+                    if lo <= entry*(1-mr_stop/100): exit_px, outcome = entry*(1-mr_stop/100), "STOP"; break
+                    if cl >= mean_now:              exit_px, outcome = cl, "MEAN"; break
+                else:
+                    if hi >= entry*(1+mr_stop/100): exit_px, outcome = entry*(1+mr_stop/100), "STOP"; break
+                    if cl <= mean_now:              exit_px, outcome = cl, "MEAN"; break
             else:
-                if hi >= entry*(1+stop_pct/100): exit_px, outcome = entry*(1+stop_pct/100), "STOP"; break
-                peak = min(peak, lo)
-                if peak <= entry*(1-trail_arm/100) and hi >= peak*(1+trail_pct/100):
-                    exit_px, outcome = peak*(1+trail_pct/100), "TRAIL"; break
-                if lo <= entry*(1-tgt_pct/100):  exit_px, outcome = entry*(1-tgt_pct/100), "TARGET"; break
+                if direction == "BULLISH":
+                    if lo <= entry*(1-stop_pct/100): exit_px, outcome = entry*(1-stop_pct/100), "STOP"; break
+                    peak = max(peak, hi)
+                    if peak >= entry*(1+trail_arm/100) and lo <= peak*(1-trail_pct/100):
+                        exit_px, outcome = peak*(1-trail_pct/100), "TRAIL"; break
+                    if hi >= entry*(1+tgt_pct/100):  exit_px, outcome = entry*(1+tgt_pct/100), "TARGET"; break
+                else:
+                    if hi >= entry*(1+stop_pct/100): exit_px, outcome = entry*(1+stop_pct/100), "STOP"; break
+                    peak = min(peak, lo)
+                    if peak <= entry*(1-trail_arm/100) and hi >= peak*(1+trail_pct/100):
+                        exit_px, outcome = peak*(1+trail_pct/100), "TRAIL"; break
+                    if lo <= entry*(1-tgt_pct/100):  exit_px, outcome = entry*(1-tgt_pct/100), "TARGET"; break
         if exit_px is None:
-            exit_px = float(data["Close"].iloc[min(i+hold_bars, len(data)-1)])
+            exit_px = float(data["Close"].iloc[min(i+hb, len(data)-1)])
         ret = (exit_px-entry)/entry*100 * (1 if direction=="BULLISH" else -1)
         trades.append(ret)
         table.append({
             "Date": str(data.index[i].date()),
             "Signal": "🟢 CALL" if direction=="BULLISH" else "🔴 PUT",
-            "Score": f"{score}/13", "ADX": adx_v, "RSI": rsi,
+            "Score": f"{score}/{max_sc}", "ADX": adx_v, "RSI": rsi,
             "Entry": f"${entry:.2f}", "Exit": f"${exit_px:.2f}",
             "Outcome": outcome, "Days": held, "Return": f"{ret:+.2f}%",
         })
@@ -1027,56 +1084,66 @@ with tab4:
 # ─── BACKTEST TAB ────────────────────────────────────────────────────────────────
 
 with tab5:
-    st.subheader("🧪 Vet a Ticker Before You Trade It")
+    st.subheader("🧪 Vet a Ticker — Which Strategy Fits?")
     st.caption(
-        "Walk-forward backtest of the directional signal on the **underlying** (Daily bars). "
-        "Tells you whether this strategy historically had an edge on a given name — "
-        "**before** you risk money on it. Options would amplify these moves (and add theta cost)."
+        "Walk-forward backtest on the **underlying** (Daily bars). **Trend** buys breakouts; "
+        "**Mean-Reversion** fades extremes. Use *Compare Both* to see which one historically "
+        "worked on a given name — they tend to be opposites (trenders vs choppy names)."
     )
 
     bc1, bc2, bc3 = st.columns([2,1,1])
-    bt_symbol = bc1.text_input("Ticker", value="AAPL", key="bt_sym").strip().upper()
+    bt_symbol = bc1.text_input("Ticker", value="AMD", key="bt_sym").strip().upper()
     bt_window = bc2.selectbox("Lookback", ["3 months","6 months","1 year","2 years"], index=2)
-    bt_score  = bc3.slider("Min score", 0, 13, 9, key="bt_score")
+    bt_mode   = bc3.selectbox("Strategy", ["Compare Both","Trend only","Mean-Reversion only"], index=0)
     win_map   = {"3 months":63, "6 months":126, "1 year":252, "2 years":500}
+
+    def _verdict(arr):
+        wr = (arr > 0).mean()*100; exp = float(arr.mean())
+        if exp > 0.3 and wr >= 45:  return "🟢 TRADEABLE", "success", wr, exp
+        if exp > 0:                 return "🟡 MARGINAL", "warning", wr, exp
+        return "🔴 AVOID", "error", wr, exp
+
+    def _show_one(label, strat, score_floor):
+        trades, table = run_backtest(bt_symbol, win_map[bt_window], score_floor, min_adx, strategy=strat)
+        if trades is None:
+            st.error(f"Couldn't fetch enough history for {bt_symbol}."); return None
+        if not trades:
+            st.warning(f"**{label}:** no signals at score ≥{score_floor} — strategy stayed out (not necessarily bad)."); return None
+        arr = np.array(trades)
+        verdict, vcolor, wr, exp = _verdict(arr)
+        getattr(st, vcolor)(f"**{label} → {bt_symbol}: {verdict}**")
+        k1,k2,k3,k4,k5 = st.columns(5)
+        k1.metric("Signals", len(arr)); k2.metric("Win Rate", f"{wr:.0f}%")
+        k3.metric("Expectancy", f"{exp:+.2f}%"); k4.metric("Total", f"{arr.sum():+.1f}%")
+        k5.metric("Best/Worst", f"{arr.max():+.0f}/{arr.min():+.0f}%")
+        with st.expander(f"{label} — every trade"):
+            st.dataframe(pd.DataFrame(table[::-1]), use_container_width=True, hide_index=True)
+        return exp
 
     if st.button("▶️ Run Backtest", use_container_width=True):
         with st.spinner(f"Backtesting {bt_symbol}…"):
-            trades, table = run_backtest(bt_symbol, win_map[bt_window], bt_score, min_adx)
-
-        if trades is None:
-            st.error(f"Couldn't fetch enough history for {bt_symbol}.")
-        elif not trades:
-            st.warning(f"No signals fired for {bt_symbol} at score ≥{bt_score} in this window. The strategy stayed out — that's not necessarily bad.")
-        else:
-            arr  = np.array(trades)
-            wins = arr[arr > 0]
-            win_rate = len(wins)/len(arr)*100
-            expectancy = float(arr.mean())
-            total = float(arr.sum())
-
-            # Verdict
-            if expectancy > 0.3 and win_rate >= 45:
-                verdict, vcolor = "🟢 TRADEABLE — historical edge", "success"
-            elif expectancy > 0:
-                verdict, vcolor = "🟡 MARGINAL — thin edge, trade small", "warning"
+            if bt_mode == "Trend only":
+                _show_one("📈 Trend", "trend", 9)
+            elif bt_mode == "Mean-Reversion only":
+                _show_one("🔄 Mean-Reversion", "mean_reversion", 6)
             else:
-                verdict, vcolor = "🔴 AVOID — strategy loses on this name", "error"
-            getattr(st, vcolor)(f"**{bt_symbol}: {verdict}**")
+                e_tr = _show_one("📈 Trend", "trend", 9)
+                st.divider()
+                e_mr = _show_one("🔄 Mean-Reversion", "mean_reversion", 6)
+                # Recommendation
+                if e_tr is not None or e_mr is not None:
+                    et, em = (e_tr or -99), (e_mr or -99)
+                    if max(et, em) <= 0:
+                        st.info(f"🛑 **Recommendation:** Neither strategy has an edge on {bt_symbol} — **skip this name.**")
+                    elif et >= em:
+                        st.success(f"✅ **Recommendation:** Trade **{bt_symbol}** with the **📈 Trend** strategy (better expectancy: {et:+.2f}% vs {em:+.2f}%).")
+                    else:
+                        st.success(f"✅ **Recommendation:** Trade **{bt_symbol}** with the **🔄 Mean-Reversion** strategy (better expectancy: {em:+.2f}% vs {et:+.2f}%).")
 
-            k1,k2,k3,k4,k5 = st.columns(5)
-            k1.metric("Signals", len(arr))
-            k2.metric("Win Rate", f"{win_rate:.0f}%")
-            k3.metric("Expectancy", f"{expectancy:+.2f}%", help="Average return per trade on the underlying")
-            k4.metric("Total", f"{total:+.1f}%")
-            k5.metric("Best / Worst", f"{arr.max():+.1f}/{arr.min():+.1f}%")
-
-            st.dataframe(pd.DataFrame(table[::-1]), use_container_width=True, hide_index=True)
-            st.caption(
-                "⚠️ Underlying returns only — real options add theta decay & spread, "
-                "so treat a thin positive expectancy as roughly breakeven. "
-                "Rules: enter next open, hold ≤10 days, −4% stop, +4% trailing stop once +4% in profit."
-            )
+        st.caption(
+            "⚠️ Underlying returns only — real options add theta & spread. "
+            "Trend: hold ≤10d, −4% stop, +4% trailing. Mean-Reversion: hold ≤7d, exit at the mean (SMA10), −5% stop."
+        )
 
 # ─── FOOTER ──────────────────────────────────────────────────────────────────────
 st.divider()
