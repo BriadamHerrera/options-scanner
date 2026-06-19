@@ -111,13 +111,17 @@ with st.sidebar:
 
     strategy_label = st.radio(
         "📊 Strategy",
-        ["📈 Trend / Breakout", "🔄 Mean-Reversion"],
+        ["📈 Trend / Breakout", "🔄 Mean-Reversion", "🎯 Supertrend Reversal"],
         index=0,
-        help="Trend: buy breakouts, ride momentum (clean trenders like AMD, GOOGL). "
-             "Mean-Reversion: fade oversold/overbought extremes (choppy names like PLTR, NVDA). "
-             "Use the Backtest tab's 'Compare Both' to see which fits a ticker.",
+        help="Trend: buy breakouts, ride momentum (AMD, GOOGL). "
+             "Mean-Reversion: fade extremes (PLTR, NVDA). "
+             "Supertrend Reversal: ChartPrime-style reversal + 2-confluence filter — "
+             "the best directional setup in our backtests, but REGIME-DEPENDENT "
+             "(profitable ~2 of 4 years). Use 30 DTE. Paper-trade first.",
     )
-    strategy_mode = "mean_reversion" if "Mean" in strategy_label else "trend"
+    strategy_mode = ("mean_reversion" if "Mean" in strategy_label
+                     else "chartprime_reversal" if "Supertrend" in strategy_label
+                     else "trend")
 
     st.caption("**Quick presets**")
     pc1, pc2 = st.columns(2)
@@ -648,6 +652,89 @@ def best_contract(ticker_obj, direction, spot, target_dte):
         return None
 
 
+# ─── SUPERTREND REVERSAL (ChartPrime-style + confluence filter) ──────────────────
+
+def _supertrend_dir(hist, period=10, mult=2.0):
+    """Supertrend direction series: +1 uptrend / -1 downtrend (ATR trailing stop)."""
+    h, l, c = hist["High"], hist["Low"], hist["Close"]
+    hl2 = (h + l) / 2
+    tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(span=period, adjust=False).mean()
+    upper = hl2 + mult*atr; lower = hl2 - mult*atr
+    fu = upper.copy(); fl = lower.copy()
+    d = np.ones(len(hist))
+    cv = c.values; uv = upper.values; lv = lower.values; fuv = fu.values; flv = fl.values
+    for i in range(1, len(hist)):
+        fuv[i] = min(uv[i], fuv[i-1]) if cv[i-1] <= fuv[i-1] else uv[i]
+        flv[i] = max(lv[i], flv[i-1]) if cv[i-1] >= flv[i-1] else lv[i]
+        if   cv[i] > fuv[i-1]: d[i] = 1
+        elif cv[i] < flv[i-1]: d[i] = -1
+        else:                  d[i] = d[i-1]
+    return d
+
+
+def _st_reversal_result(symbol, hist, target_dte, tf_label, open_wait_mins):
+    """ChartPrime-style Supertrend reversal + 2-of-4 confluence filter."""
+    close, high, low, volume = hist["Close"], hist["High"], hist["Low"], hist["Volume"]
+    spot = float(close.iloc[-1]); prev = float(close.iloc[-2])
+    chg  = round((spot - prev) / prev * 100, 2)
+
+    d = _supertrend_dir(hist)
+    flip_up = d[-1] == 1 and d[-2] == -1
+    flip_dn = d[-1] == -1 and d[-2] == 1
+    direction = "BULLISH" if flip_up else "BEARISH" if flip_dn else "NEUTRAL"
+
+    sma200 = float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else spot
+    rsi_v  = round(float(rsi_calc(close, 14)), 1)
+    adx_v, _, _ = adx_calc(high, low, close); adx_v = round(adx_v, 1)
+    vol_avg = float(volume.iloc[-21:-1].mean()); vol_ratio = round(float(volume.iloc[-1])/vol_avg, 2) if vol_avg>0 else 1.0
+
+    conf = {}
+    score = 0
+    if direction != "NEUTRAL":
+        bull = direction == "BULLISH"
+        conf["Trend align (200MA)"] = (bull and spot > sma200) or (not bull and spot < sma200)
+        conf["RSI confirms"]        = (bull and rsi_v < 45) or (not bull and rsi_v > 55)
+        conf["Volume climax"]       = vol_ratio > 1.2
+        conf["ADX < 35 (not extended)"] = adx_v < 35
+        score = sum(1 for v in conf.values() if v)
+
+    # require 2+ confluences (the validated filter)
+    if direction == "NEUTRAL" or score < 2:
+        signal = "WAIT"
+    elif direction == "BULLISH":
+        signal = "CALL"
+    else:
+        signal = "PUT"
+    if score >= 4:   strength, sval = "🔥 Strong", 3
+    elif score == 3: strength, sval = "⚡ Medium", 2
+    else:            strength, sval = "💤 Weak", 1
+
+    opt, iv_rank, spread_ok = None, None, False
+    if signal != "WAIT":
+        opt = best_contract(yf.Ticker(symbol), direction, spot, target_dte)
+        if opt:
+            iv_rank = iv_rank_estimate(symbol, opt["iv"], tf_label, open_wait_mins)
+            spread_ok = opt["spread_pct"] < 15
+
+    ed = get_earnings_date(symbol); today = datetime.today().date()
+    dte_e = (ed - today).days if ed else None
+    earn_near = dte_e is not None and 0 <= dte_e <= 5
+
+    return {
+        "symbol":symbol, "spot":spot, "chg":chg, "signal":signal, "direction":direction,
+        "score":score, "score_max":4, "strategy":"chartprime_reversal",
+        "strength":strength, "strength_val":sval, "adx":adx_v, "hv":0.0,
+        "vol_ratio":vol_ratio, "opt":opt, "iv_rank":iv_rank, "spread_ok":spread_ok,
+        "rsi_val":rsi_v, "rsi_ok":True, "conf_flags":conf,
+        "breakout_pts":0, "confirmed":False, "ema_stack_pts":0, "ema_stack_full":False,
+        "adx_ok":(adx_v<35), "squeeze":False, "macd_ok":False, "macd_dir":"NEUTRAL",
+        "candle_ok":False, "rs_ok":False, "rs_val":0.0, "atr_ok":True, "atr_ratio":0.0,
+        "spy_aligned":False, "earnings_date":str(ed) if ed else None,
+        "days_to_earn":dte_e, "earnings_near":earn_near,
+    }
+
+
 # ─── CORE SCANNER ────────────────────────────────────────────────────────────────
 
 def _mr_result(symbol, hist, target_dte, tf_label, open_wait_mins):
@@ -706,6 +793,8 @@ def scan(symbol, target_dte, min_adx_val, spy_regime, spy_ret20, tf_label, open_
 
         if strategy == "mean_reversion":
             return _mr_result(symbol, hist, target_dte, tf_label, open_wait_mins)
+        if strategy == "chartprime_reversal":
+            return _st_reversal_result(symbol, hist, target_dte, tf_label, open_wait_mins)
 
         close  = hist["Close"]
         high   = hist["High"]
@@ -906,10 +995,14 @@ spy_label = (
     else "❓ Unknown Regime"
 )
 _open_note = f"  ·  ⏳ skipping first {open_wait_mins} min" if (open_wait_mins and tf_label != "Daily") else ""
-_strat_badge = "🔄 **Mean-Reversion**" if strategy_mode == "mean_reversion" else "📈 **Trend / Breakout**"
+_strat_badge = ("🔄 **Mean-Reversion**" if strategy_mode == "mean_reversion"
+                else "🎯 **Supertrend Reversal**" if strategy_mode == "chartprime_reversal"
+                else "📈 **Trend / Breakout**")
 st.info(f"**Strategy:** {_strat_badge}  |  **Market Regime:** {spy_label}  |  ⏱ **{tf_label}**{_open_note}")
 if strategy_mode == "mean_reversion":
     st.caption("🔄 Mean-Reversion fades oversold dips / overbought rips. Best on choppy names (PLTR, NVDA). Score is out of 10. Lower your 'Min signal score' to ~5–6 since MR maxes at 10.")
+if strategy_mode == "chartprime_reversal":
+    st.warning("🎯 **Supertrend Reversal** fires only when the ATR trend flips AND ≥2 of 4 confluences confirm. Score is out of 4 — set 'Min signal score' to **2**. **Use 30 DTE.** ⚠️ This was the best directional setup in backtests but is **regime-dependent (profitable ~2 of 4 years)** — paper-trade it, size small, expect losing stretches. Signals are rare by design (only on fresh flips).")
 
 bar  = st.progress(0, text="Scanning…")
 rows = []
@@ -918,7 +1011,11 @@ for i, sym in enumerate(watchlist):
     r = scan(sym, target_dte, min_adx, spy_regime, spy_ret20, tf_label, open_wait_mins, strategy_mode)
     if r is None:
         continue
-    if r["score"] < min_score:
+    # cap the score floor to each strategy's own scale so signals aren't silently hidden
+    eff_floor = min(min_score, r.get("score_max", 13))
+    if strategy_mode == "chartprime_reversal":
+        eff_floor = min(min_score, 2)  # 2-confluence is the validated filter
+    if r["score"] < eff_floor:
         continue
     if not show_wait and r["signal"] == "WAIT":
         continue
@@ -967,6 +1064,10 @@ def render_table(data):
             flags.append("🔄 MR")
             if r.get("rsi2") is not None:    flags.append(f"RSI2 {r['rsi2']:.0f}")
             if r.get("adx_ok"):              flags.append(f"〰 Choppy(ADX{r['adx']})")
+        elif r.get("strategy") == "chartprime_reversal":
+            flags.append("🎯 Reversal")
+            for lab, ok in r.get("conf_flags", {}).items():
+                if ok: flags.append(f"✓{lab.split()[0]}")
         else:
             if r.get("confirmed"):           flags.append("✅ Break+")
             if r.get("ema_stack_full"):      flags.append("📐 EMA✓✓")
@@ -1066,6 +1167,24 @@ with tab4:
                     earn_txt = "safe ✓" if not r['earnings_near'] else f"{r['days_to_earn']}d — IV crush risk"
                     st.markdown(f"{'✅' if not r['earnings_near'] else '⚠️'} **Earnings** — {earn_txt}")
                 st.warning("⚠️ Mean-reversion = catching a falling knife. Exit fast at the mean (SMA10), honor the −5% stop. Verify it's a *dip*, not a *collapse*.")
+            elif r.get("strategy") == "chartprime_reversal":
+                st.subheader("✅ Supertrend Reversal — Confluence Stack")
+                cf = r.get("conf_flags", {})
+                rc1, rc2 = st.columns(2)
+                with rc1:
+                    st.markdown("**🎯 Confluences (need ≥2)**")
+                    for lab, ok in cf.items():
+                        st.markdown(f"{'✅' if ok else '❌'} **{lab}**")
+                with rc2:
+                    st.markdown("**💸 Tradeability**")
+                    iv_cheap = r['iv_rank'] is not None and r['iv_rank'] <= 45
+                    st.markdown(f"{'✅' if iv_cheap else '❌'} **IV Rank {r['iv_rank'] if r['iv_rank'] is not None else '?'}%**")
+                    spread_label = f"{opt['spread_pct']:.1f}%" if opt else "—"
+                    st.markdown(f"{'✅' if r.get('spread_ok') else '❌'} **Spread {spread_label}**")
+                    earn_txt = "safe ✓" if not r['earnings_near'] else f"{r['days_to_earn']}d — IV crush risk"
+                    st.markdown(f"{'✅' if not r['earnings_near'] else '⚠️'} **Earnings** — {earn_txt}")
+                st.markdown(f"**Confluence score: {r['score']}/4**  ·  recommended exit: hold for the trend, opposite Supertrend flip or −4% stop.")
+                st.warning("⚠️ **Use 30 DTE** (shorter expiries get eaten by theta). Regime-dependent — profitable ~2 of 4 years in backtest. Paper-trade first, size small, expect losing stretches.")
             else:
                 st.subheader("✅ Anti-Fakeout Checklist (13 Factors)")
                 col1, col2 = st.columns(2)
