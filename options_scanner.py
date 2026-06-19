@@ -427,6 +427,26 @@ def mr_score_at_bar(window):
     return direction, score, round(rsi2,1), round(adx_v,1)
 
 
+def _topdown_signal_at_bar(window):
+    """Top-down: 50-bar key-level reclaim aligned with 200-EMA trend, high-vol only.
+       Returns (direction, stop_ref_price)."""
+    close, high, low = window["Close"], window["High"], window["Low"]
+    if len(close) < 200:
+        return "NEUTRAL", None
+    spot = float(close.iloc[-1]); o = float(window["Open"].iloc[-1])
+    l = float(low.iloc[-1]); h = float(high.iloc[-1])
+    e200 = float(ema(close, 200).iloc[-1])
+    swing_lo = float(low.rolling(50).min().shift(1).iloc[-1])
+    swing_hi = float(high.rolling(50).max().shift(1).iloc[-1])
+    if historical_vol(close) < 40:      # high-vol gate (the strategy's requirement)
+        return "NEUTRAL", None
+    if spot > e200 and l < swing_lo and spot > swing_lo and spot > o:
+        return "BULLISH", min(l, swing_lo)
+    if spot < e200 and h > swing_hi and spot < swing_hi and spot < o:
+        return "BEARISH", max(h, swing_hi)
+    return "NEUTRAL", None
+
+
 # ─── BACKTEST ENGINE ─────────────────────────────────────────────────────────────
 
 def _score_at_bar(window, spy_window, min_adx_val):
@@ -489,22 +509,33 @@ def run_backtest(symbol, eval_days, min_score_bt, min_adx_val, hold_bars=10,
         return None, None
 
     is_mr   = strategy == "mean_reversion"
-    max_sc  = 10 if is_mr else 13
+    is_td   = strategy == "topdown"
+    max_sc  = 10 if is_mr else 3 if is_td else 13
     mr_stop = 5.0   # mean-reversion knife-protection stop
     mr_hold = 7     # mean-reversion holds shorter
     start = len(data) - eval_days
     trades, table = [], []
     for i in range(max(start, 220), len(data)):
         w, sw = data.iloc[:i+1], spy.iloc[:i+1]
+        td_stop_ref = None
         if is_mr:
             direction, score, rsi, adx_v = mr_score_at_bar(w)
+        elif is_td:
+            direction, td_stop_ref = _topdown_signal_at_bar(w)
+            score = 2; rsi = round(float(rsi_calc(w["Close"])), 1); adx_v = 0.0
         else:
             direction, score, adx_v, rsi = _score_at_bar(w, sw, min_adx_val)
-        if direction == "NEUTRAL" or score < min_score_bt or i+1 >= len(data):
+        floor = 0 if is_td else min_score_bt
+        if direction == "NEUTRAL" or score < floor or i+1 >= len(data):
             continue
         entry = float(data["Open"].iloc[i+1]); exit_px, outcome, held = None, "TIME", 0
         peak = entry
         hb = mr_hold if is_mr else hold_bars
+        if is_td:
+            risk = (entry - td_stop_ref) if direction == "BULLISH" else (td_stop_ref - entry)
+            if risk <= 0: risk = entry * 0.02
+            td_stop = entry - risk if direction == "BULLISH" else entry + risk
+            td_tgt  = entry + 2*risk if direction == "BULLISH" else entry - 2*risk
         for j in range(i+1, min(i+1+hb, len(data))):
             held += 1
             hi, lo, cl = float(data["High"].iloc[j]), float(data["Low"].iloc[j]), float(data["Close"].iloc[j])
@@ -517,6 +548,14 @@ def run_backtest(symbol, eval_days, min_score_bt, min_adx_val, hold_bars=10,
                 else:
                     if hi >= entry*(1+mr_stop/100): exit_px, outcome = entry*(1+mr_stop/100), "STOP"; break
                     if cl <= mean_now:              exit_px, outcome = cl, "MEAN"; break
+            elif is_td:
+                # Top-down: fixed 2:1 risk/reward on the underlying
+                if direction == "BULLISH":
+                    if lo <= td_stop: exit_px, outcome = td_stop, "STOP"; break
+                    if hi >= td_tgt:  exit_px, outcome = td_tgt, "TARGET"; break
+                else:
+                    if hi >= td_stop: exit_px, outcome = td_stop, "STOP"; break
+                    if lo <= td_tgt:  exit_px, outcome = td_tgt, "TARGET"; break
             else:
                 if direction == "BULLISH":
                     if lo <= entry*(1-stop_pct/100): exit_px, outcome = entry*(1-stop_pct/100), "STOP"; break
@@ -1398,7 +1437,7 @@ with tab5:
     bc1, bc2, bc3 = st.columns([2,1,1])
     bt_symbol = bc1.text_input("Ticker", value="AMD", key="bt_sym").strip().upper()
     bt_window = bc2.selectbox("Lookback", ["3 months","6 months","1 year","2 years"], index=2)
-    bt_mode   = bc3.selectbox("Strategy", ["Compare Both","Trend only","Mean-Reversion only"], index=0)
+    bt_mode   = bc3.selectbox("Strategy", ["Compare All","Trend only","Mean-Reversion only","Top-Down Levels only"], index=0)
     win_map   = {"3 months":63, "6 months":126, "1 year":252, "2 years":500}
 
     def _verdict(arr):
@@ -1430,23 +1469,28 @@ with tab5:
                 _show_one("📈 Trend", "trend", 9)
             elif bt_mode == "Mean-Reversion only":
                 _show_one("🔄 Mean-Reversion", "mean_reversion", 6)
+            elif bt_mode == "Top-Down Levels only":
+                _show_one("🏔 Top-Down Levels", "topdown", 0)
             else:
                 e_tr = _show_one("📈 Trend", "trend", 9)
                 st.divider()
                 e_mr = _show_one("🔄 Mean-Reversion", "mean_reversion", 6)
-                # Recommendation
-                if e_tr is not None or e_mr is not None:
-                    et, em = (e_tr or -99), (e_mr or -99)
-                    if max(et, em) <= 0:
-                        st.info(f"🛑 **Recommendation:** Neither strategy has an edge on {bt_symbol} — **skip this name.**")
-                    elif et >= em:
-                        st.success(f"✅ **Recommendation:** Trade **{bt_symbol}** with the **📈 Trend** strategy (better expectancy: {et:+.2f}% vs {em:+.2f}%).")
+                st.divider()
+                e_td = _show_one("🏔 Top-Down Levels", "topdown", 0)
+                # Recommendation — pick the best of the three
+                cands = [("📈 Trend", e_tr), ("🔄 Mean-Reversion", e_mr), ("🏔 Top-Down Levels", e_td)]
+                cands = [(n, e) for n, e in cands if e is not None]
+                if cands:
+                    best_n, best_e = max(cands, key=lambda x: x[1])
+                    if best_e <= 0:
+                        st.info(f"🛑 **Recommendation:** No strategy has an edge on {bt_symbol} — **skip this name.**")
                     else:
-                        st.success(f"✅ **Recommendation:** Trade **{bt_symbol}** with the **🔄 Mean-Reversion** strategy (better expectancy: {em:+.2f}% vs {et:+.2f}%).")
+                        st.success(f"✅ **Recommendation:** Trade **{bt_symbol}** with **{best_n}** (best expectancy: {best_e:+.2f}%/trade).")
 
         st.caption(
             "⚠️ Underlying returns only — real options add theta & spread. "
-            "Trend: hold ≤10d, −4% stop, +4% trailing. Mean-Reversion: hold ≤7d, exit at the mean (SMA10), −5% stop."
+            "Trend: hold ≤10d, −4% stop, +4% trailing. Mean-Reversion: hold ≤7d, exit at mean (SMA10), −5% stop. "
+            "Top-Down: 50-bar level reclaim + 200-EMA trend + HV≥40% gate, 2:1 risk."
         )
 
 # ─── FOOTER ──────────────────────────────────────────────────────────────────────
