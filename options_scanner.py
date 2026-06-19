@@ -111,16 +111,18 @@ with st.sidebar:
 
     strategy_label = st.radio(
         "📊 Strategy",
-        ["📈 Trend / Breakout", "🔄 Mean-Reversion", "🎯 Supertrend Reversal"],
+        ["📈 Trend / Breakout", "🔄 Mean-Reversion", "🎯 Supertrend Reversal", "🏔 Top-Down Levels"],
         index=0,
-        help="Trend: buy breakouts, ride momentum (AMD, GOOGL). "
+        help="Trend: buy breakouts (AMD, GOOGL). "
              "Mean-Reversion: fade extremes (PLTR, NVDA). "
-             "Supertrend Reversal: ChartPrime-style reversal + 2-confluence filter — "
-             "the best directional setup in our backtests, but REGIME-DEPENDENT "
-             "(profitable ~2 of 4 years). Use 30 DTE. Paper-trade first.",
+             "Supertrend Reversal: ChartPrime-style + confluence. "
+             "Top-Down Levels: key-level reclaim + higher-TF trend + 2:1 risk — the most "
+             "robust directional setup in our tests (survived out-of-sample AND across "
+             "universes), but ONLY on high-volatility stocks. Use 30 DTE. Paper-trade first.",
     )
     strategy_mode = ("mean_reversion" if "Mean" in strategy_label
                      else "chartprime_reversal" if "Supertrend" in strategy_label
+                     else "topdown" if "Top-Down" in strategy_label
                      else "trend")
 
     st.caption("**Quick presets**")
@@ -735,6 +737,73 @@ def _st_reversal_result(symbol, hist, target_dte, tf_label, open_wait_mins):
     }
 
 
+# ─── TOP-DOWN KEY-LEVEL RECLAIM (level + reclaim + higher-TF trend + 2:1 risk) ───
+
+def _topdown_result(symbol, hist, target_dte, tf_label, open_wait_mins):
+    """Key 50-bar level reclaim, aligned with the 200-EMA trend. High-vol names only."""
+    close, high, low, volume = hist["Close"], hist["High"], hist["Low"], hist["Volume"]
+    spot = float(close.iloc[-1]); prev = float(close.iloc[-2])
+    chg  = round((spot - prev) / prev * 100, 2)
+
+    e200 = float(ema(close, 200).iloc[-1]) if len(close) >= 200 else spot
+    swing_lo = float(low.rolling(50).min().shift(1).iloc[-1])
+    swing_hi = float(high.rolling(50).max().shift(1).iloc[-1])
+    o = float(hist["Open"].iloc[-1]); l = float(low.iloc[-1]); h = float(high.iloc[-1])
+    trend_up = spot > e200
+
+    direction = "NEUTRAL"; stop_ref = None
+    # reclaim of support in an uptrend / reclaim of resistance in a downtrend
+    if trend_up and l < swing_lo and spot > swing_lo and spot > o:
+        direction = "BULLISH"; stop_ref = min(l, swing_lo)
+    elif (not trend_up) and h > swing_hi and spot < swing_hi and spot < o:
+        direction = "BEARISH"; stop_ref = max(h, swing_hi)
+
+    # volatility gate — this setup only worked on high-vol underlyings
+    hv = round(historical_vol(close), 1)
+    vol_ok = hv >= 40  # annualized %; defensives/ETFs fall below this
+
+    adx_v, _, _ = adx_calc(high, low, close); adx_v = round(adx_v, 1)
+    rsi_v = round(float(rsi_calc(close)), 1)
+    vol_avg = float(volume.iloc[-21:-1].mean()); vol_ratio = round(float(volume.iloc[-1])/vol_avg, 2) if vol_avg>0 else 1.0
+
+    if direction == "NEUTRAL" or not vol_ok:
+        signal = "WAIT"; score = 0
+    else:
+        score = 2 + (1 if vol_ratio >= 1.5 else 0)  # base 2, +1 for volume
+        signal = "CALL" if direction == "BULLISH" else "PUT"
+    strength, sval = ("🔥 Strong", 3) if score >= 3 else ("⚡ Medium", 2) if score == 2 else ("💤 Weak", 1)
+
+    # risk levels (2:1) on the underlying
+    risk_pct = round(abs(spot - stop_ref)/spot*100, 1) if stop_ref else None
+    target_px = round(spot + 2*(spot-stop_ref), 2) if stop_ref and direction=="BULLISH" else round(spot - 2*(stop_ref-spot), 2) if stop_ref else None
+
+    opt, iv_rank, spread_ok = None, None, False
+    if signal != "WAIT":
+        opt = best_contract(yf.Ticker(symbol), direction, spot, target_dte)
+        if opt:
+            iv_rank = iv_rank_estimate(symbol, opt["iv"], tf_label, open_wait_mins)
+            spread_ok = opt["spread_pct"] < 15
+
+    ed = get_earnings_date(symbol); today = datetime.today().date()
+    dte_e = (ed - today).days if ed else None
+    earn_near = dte_e is not None and 0 <= dte_e <= 5
+
+    return {
+        "symbol":symbol, "spot":spot, "chg":chg, "signal":signal, "direction":direction,
+        "score":score, "score_max":3, "strategy":"topdown",
+        "strength":strength, "strength_val":sval, "adx":adx_v, "hv":hv,
+        "vol_ratio":vol_ratio, "opt":opt, "iv_rank":iv_rank, "spread_ok":spread_ok,
+        "rsi_val":rsi_v, "rsi_ok":True, "td_stop_pct":risk_pct, "td_target":target_px,
+        "td_stop_ref":round(stop_ref,2) if stop_ref else None, "td_vol_ok":vol_ok,
+        "td_level":round(swing_lo if direction=="BULLISH" else swing_hi, 2) if direction!="NEUTRAL" else None,
+        "breakout_pts":0, "confirmed":False, "ema_stack_pts":0, "ema_stack_full":False,
+        "adx_ok":True, "squeeze":False, "macd_ok":False, "macd_dir":"NEUTRAL",
+        "candle_ok":False, "rs_ok":False, "rs_val":0.0, "atr_ok":True, "atr_ratio":0.0,
+        "spy_aligned":False, "earnings_date":str(ed) if ed else None,
+        "days_to_earn":dte_e, "earnings_near":earn_near,
+    }
+
+
 # ─── CORE SCANNER ────────────────────────────────────────────────────────────────
 
 def _mr_result(symbol, hist, target_dte, tf_label, open_wait_mins):
@@ -795,6 +864,8 @@ def scan(symbol, target_dte, min_adx_val, spy_regime, spy_ret20, tf_label, open_
             return _mr_result(symbol, hist, target_dte, tf_label, open_wait_mins)
         if strategy == "chartprime_reversal":
             return _st_reversal_result(symbol, hist, target_dte, tf_label, open_wait_mins)
+        if strategy == "topdown":
+            return _topdown_result(symbol, hist, target_dte, tf_label, open_wait_mins)
 
         close  = hist["Close"]
         high   = hist["High"]
@@ -997,8 +1068,11 @@ spy_label = (
 _open_note = f"  ·  ⏳ skipping first {open_wait_mins} min" if (open_wait_mins and tf_label != "Daily") else ""
 _strat_badge = ("🔄 **Mean-Reversion**" if strategy_mode == "mean_reversion"
                 else "🎯 **Supertrend Reversal**" if strategy_mode == "chartprime_reversal"
+                else "🏔 **Top-Down Levels**" if strategy_mode == "topdown"
                 else "📈 **Trend / Breakout**")
 st.info(f"**Strategy:** {_strat_badge}  |  **Market Regime:** {spy_label}  |  ⏱ **{tf_label}**{_open_note}")
+if strategy_mode == "topdown":
+    st.warning("🏔 **Top-Down Levels** — fires when price reclaims a 50-bar key level *in the direction of the 200-EMA trend*, on **high-volatility names only** (HV ≥ 40%; defensives/ETFs are filtered out). Score 0–3, set 'Min signal score' to **2**. **Use 30 DTE**, risk via the 2:1 stop/target shown. ✅ Most robust setup in our tests (survived out-of-sample *and* across stock universes) — but still **regime-dependent** (recent year was negative). Paper-trade first.")
 if strategy_mode == "mean_reversion":
     st.caption("🔄 Mean-Reversion fades oversold dips / overbought rips. Best on choppy names (PLTR, NVDA). Score is out of 10. Lower your 'Min signal score' to ~5–6 since MR maxes at 10.")
 if strategy_mode == "chartprime_reversal":
@@ -1015,6 +1089,8 @@ for i, sym in enumerate(watchlist):
     eff_floor = min(min_score, r.get("score_max", 13))
     if strategy_mode == "chartprime_reversal":
         eff_floor = min(min_score, 2)  # 2-confluence is the validated filter
+    if strategy_mode == "topdown":
+        eff_floor = min(min_score, 2)  # base setup scores 2
     if r["score"] < eff_floor:
         continue
     if not show_wait and r["signal"] == "WAIT":
@@ -1068,6 +1144,11 @@ def render_table(data):
             flags.append("🎯 Reversal")
             for lab, ok in r.get("conf_flags", {}).items():
                 if ok: flags.append(f"✓{lab.split()[0]}")
+        elif r.get("strategy") == "topdown":
+            flags.append("🏔 Reclaim")
+            if r.get("td_level") is not None: flags.append(f"lvl ${r['td_level']}")
+            if r.get("hv"): flags.append(f"HV{r['hv']:.0f}")
+            if r.get("td_stop_pct"): flags.append(f"risk {r['td_stop_pct']}%")
         else:
             if r.get("confirmed"):           flags.append("✅ Break+")
             if r.get("ema_stack_full"):      flags.append("📐 EMA✓✓")
@@ -1185,6 +1266,24 @@ with tab4:
                     st.markdown(f"{'✅' if not r['earnings_near'] else '⚠️'} **Earnings** — {earn_txt}")
                 st.markdown(f"**Confluence score: {r['score']}/4**  ·  recommended exit: hold for the trend, opposite Supertrend flip or −4% stop.")
                 st.warning("⚠️ **Use 30 DTE** (shorter expiries get eaten by theta). Regime-dependent — profitable ~2 of 4 years in backtest. Paper-trade first, size small, expect losing stretches.")
+            elif r.get("strategy") == "topdown":
+                st.subheader("✅ Top-Down Level Reclaim")
+                tc1, tc2 = st.columns(2)
+                with tc1:
+                    st.markdown("**🏔 Setup**")
+                    st.markdown(f"✅ **Key level reclaimed** — 50-bar {'support' if r['signal']=='CALL' else 'resistance'} at ${r.get('td_level','?')}")
+                    st.markdown(f"✅ **Trend-aligned** — price {'above' if r['signal']=='CALL' else 'below'} 200-EMA")
+                    st.markdown(f"{'✅' if r.get('td_vol_ok') else '❌'} **Volatility {r.get('hv','?')}%** — {'high enough for options ✓' if r.get('td_vol_ok') else 'too low — skip'}")
+                    st.markdown(f"{'✅' if r['vol_ratio']>=1.5 else '⚪'} **Volume {r['vol_ratio']}x**")
+                with tc2:
+                    st.markdown("**🛡 Risk (2:1)**")
+                    st.markdown(f"🛑 **Stop:** ${r.get('td_stop_ref','?')}  ({r.get('td_stop_pct','?')}% away)")
+                    st.markdown(f"🎯 **Target:** ${r.get('td_target','?')}  (2× risk)")
+                    iv_cheap = r['iv_rank'] is not None and r['iv_rank'] <= 45
+                    st.markdown(f"{'✅' if iv_cheap else '❌'} **IV Rank {r['iv_rank'] if r['iv_rank'] is not None else '?'}%**")
+                    earn_txt = "safe ✓" if not r['earnings_near'] else f"{r['days_to_earn']}d — IV crush risk"
+                    st.markdown(f"{'✅' if not r['earnings_near'] else '⚠️'} **Earnings** — {earn_txt}")
+                st.warning("⚠️ **Use 30 DTE**, high-vol names only. Most robust setup in testing (survived out-of-sample + across universes) — but recent year was negative. Paper-trade first, honor the 2:1 stop.")
             else:
                 st.subheader("✅ Anti-Fakeout Checklist (13 Factors)")
                 col1, col2 = st.columns(2)
