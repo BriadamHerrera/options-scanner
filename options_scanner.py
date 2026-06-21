@@ -365,6 +365,29 @@ def bb_squeeze(close, period=20):
     return bw.iloc[-1] <= bw_min.iloc[-1] * 1.05
 
 
+def ttm_squeeze(close, high, low, length=20, bb_mult=2.0, kc_mult=1.5):
+    """John Carter's TTM Squeeze: Bollinger Bands inside Keltner Channels = volatility
+       coiled (a big move may be COMING — direction-agnostic). Returns (state, mom_dir):
+       state = 'ON' (coiled), 'FIRED' (just released, last ~6 bars), or 'OFF'.
+       mom_dir = 'BULL'/'BEAR' from a momentum oscillator — only a hint, not a signal."""
+    basis = sma(close, length)
+    dev   = bb_mult * close.rolling(length).std()
+    bb_u, bb_l = basis + dev, basis - dev
+    tr  = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(length).mean()
+    kc_u, kc_l = basis + kc_mult*atr, basis - kc_mult*atr
+    sqz_on = (bb_l > kc_l) & (bb_u < kc_u)          # BBs inside KCs = squeeze
+    # momentum: close vs the average of the Donchian mid and the SMA (Carter-style)
+    don_mid = (high.rolling(length).max() + low.rolling(length).min()) / 2
+    mom = (close - (don_mid + basis) / 2)
+    mom_s = mom.rolling(length).mean()
+    on_now = bool(sqz_on.iloc[-1])
+    fired  = (not on_now) and bool(sqz_on.iloc[-6:-1].any())
+    state  = "ON" if on_now else ("FIRED" if fired else "OFF")
+    mdir   = "BULL" if float(mom_s.iloc[-1]) > 0 else "BEAR"
+    return state, mdir
+
+
 def macd_signal(close):
     macd_line = ema(close, 12) - ema(close, 26)
     signal    = ema(macd_line, 9)
@@ -762,10 +785,12 @@ def _st_reversal_result(symbol, hist, target_dte, tf_label, open_wait_mins):
     dte_e = (ed - today).days if ed else None
     earn_near = dte_e is not None and 0 <= dte_e <= 5
 
+    ttm_state, ttm_mom = ttm_squeeze(close, high, low)
     return {
         "symbol":symbol, "spot":spot, "chg":chg, "signal":signal, "direction":direction,
         "score":score, "score_max":4, "strategy":"chartprime_reversal",
         "strength":strength, "strength_val":sval, "adx":adx_v, "hv":0.0,
+        "ttm_state":ttm_state, "ttm_mom":ttm_mom,
         "vol_ratio":vol_ratio, "opt":opt, "iv_rank":iv_rank, "spread_ok":spread_ok,
         "rsi_val":rsi_v, "rsi_ok":True, "conf_flags":conf,
         "breakout_pts":0, "confirmed":False, "ema_stack_pts":0, "ema_stack_full":False,
@@ -826,11 +851,13 @@ def _topdown_result(symbol, hist, target_dte, tf_label, open_wait_mins):
     ed = get_earnings_date(symbol); today = datetime.today().date()
     dte_e = (ed - today).days if ed else None
     earn_near = dte_e is not None and 0 <= dte_e <= 5
+    ttm_state, ttm_mom = ttm_squeeze(close, high, low)
 
     return {
         "symbol":symbol, "spot":spot, "chg":chg, "signal":signal, "direction":direction,
         "score":score, "score_max":3, "strategy":"topdown",
         "strength":strength, "strength_val":sval, "adx":adx_v, "hv":hv,
+        "ttm_state":ttm_state, "ttm_mom":ttm_mom,
         "vol_ratio":vol_ratio, "opt":opt, "iv_rank":iv_rank, "spread_ok":spread_ok,
         "rsi_val":rsi_v, "rsi_ok":True, "td_stop_pct":risk_pct, "td_target":target_px,
         "td_stop_ref":round(stop_ref,2) if stop_ref else None, "td_vol_ok":vol_ok,
@@ -876,10 +903,12 @@ def _mr_result(symbol, hist, target_dte, tf_label, open_wait_mins):
     dte_e = (ed - today).days if ed else None
     earn_near = dte_e is not None and 0 <= dte_e <= 5
 
+    ttm_state, ttm_mom = ttm_squeeze(close, high, low)
     return {
         "symbol":symbol, "spot":spot, "chg":chg, "signal":signal, "direction":direction,
         "score":score, "score_max":10, "strategy":"mean_reversion",
         "strength":strength, "strength_val":sval, "adx":adx_v, "hv":0.0,
+        "ttm_state":ttm_state, "ttm_mom":ttm_mom,
         "vol_ratio":vol_ratio, "opt":opt, "iv_rank":iv_rank, "spread_ok":spread_ok,
         "rsi2":rsi2, "rsi_val":rsi2, "rsi_ok":True,
         # trend-specific keys → neutral defaults so renderers don't crash
@@ -1072,6 +1101,7 @@ def scan(symbol, target_dte, min_adx_val, spy_regime, spy_ret20, tf_label, open_
                 elif score >= 6:
                     strength, strength_val = "⚡ Medium", 2
 
+        _ttm_state, _ttm_mom = ttm_squeeze(close, high, low)
         return {
             "symbol":        symbol,
             "spot":          spot,
@@ -1081,6 +1111,8 @@ def scan(symbol, target_dte, min_adx_val, spy_regime, spy_ret20, tf_label, open_
             "score":         score,
             "score_max":     13,
             "strategy":      "trend",
+            "ttm_state":     _ttm_state,
+            "ttm_mom":       _ttm_mom,
             "strength":      strength,
             "strength_val":  strength_val,
             "adx":           adx_val,
@@ -1158,6 +1190,12 @@ m3.metric("⚪ Wait",            len(waits))
 m4.metric("🔥 Strong Signals",  sum(1 for r in rows if r["strength_val"] == 3))
 m5.metric("📋 Total Scanned",   len(rows))
 
+st.caption(
+    "🗜 **Squeeze** column = John Carter's TTM Squeeze (Bollinger Bands inside Keltner Channels). "
+    "**Coiled** = volatility compressed, a big move may be brewing. **Fired ↑/↓** = the squeeze just "
+    "released (last ~6 bars), arrow = momentum hint. ⚠️ It's a *timing/context* flag, **not** a "
+    "direction signal — pair it with the strategy's direction, don't trade it alone."
+)
 st.divider()
 
 # ─── SIGNAL TABLE ────────────────────────────────────────────────────────────────
@@ -1195,10 +1233,17 @@ def render_table(data):
             if r.get("rs_ok"):               flags.append(f"💪 RS{r['rs_val']:+.1f}%")
             if r.get("atr_ok"):              flags.append("📡 ATR✓")
             if r.get("squeeze"):             flags.append("🗜 Squeeze")
+        # TTM Squeeze — timing/context flag (direction-agnostic)
+        _ttm = r.get("ttm_state")
+        if _ttm == "ON":      flags.append("🗜 Coiled")
+        elif _ttm == "FIRED": flags.append(f"🔥 SqzFired{'↑' if r.get('ttm_mom')=='BULL' else '↓'}")
         if r["vol_ratio"] >= 1.5:        flags.append(f"📈 Vol{r['vol_ratio']}x")
         if r["iv_rank"] is not None and r["iv_rank"] <= 30: flags.append("💰 LowIV")
         if r.get("earnings_near"):       flags.append(f"⚠️ Earn{r['days_to_earn']}d")
 
+        ttm_disp = ("🗜 Coiled" if _ttm == "ON"
+                    else f"🔥 Fired {'↑' if r.get('ttm_mom')=='BULL' else '↓'}" if _ttm == "FIRED"
+                    else "—")
         row = {
             "Ticker":     r["symbol"],
             "Price":      f"${r['spot']:.2f}",
@@ -1206,6 +1251,7 @@ def render_table(data):
             "Signal":     sig,
             "Score":      f"{r['score']}/{r.get('score_max',13)}",
             "Strength":   r["strength"],
+            "Squeeze":    ttm_disp,
             "ADX":        r["adx"],
             "RSI":        r["rsi_val"],
             "RS vs SPY":  f"{r['rs_val']:+.1f}%" if r.get("rs_val") is not None else "—",
